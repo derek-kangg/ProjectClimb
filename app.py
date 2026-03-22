@@ -1,8 +1,11 @@
 import streamlit as st
 from openai import OpenAI
 import base64
+from dotenv import load_dotenv
+import os
 
-client = OpenAI(api_key="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")
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 st.title("🧗 ProjectClimb")
 st.write("Upload a photo of a climbing wall and get a route breakdown!")
