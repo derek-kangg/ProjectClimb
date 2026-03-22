@@ -1,7 +1,10 @@
 from openai import OpenAI
+from dotenv import load_dotenv
+import os
 import base64
 
-client = OpenAI(api_key="***REMOVED-OPENAI-KEY***")
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Load and encode the image
 with open("wall.jpg", "rb") as f:
