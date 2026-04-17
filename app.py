@@ -250,6 +250,90 @@ Always reference holds by number. Never skip matches or flags — they are as im
     )
     return message.choices[0].message.content
 
+def get_structured_sequence(instructions, holds):
+    hold_map = {h["number"]: h for h in holds}
+    hold_info = ", ".join([f"Hold {h['number']} at x={h['x']}, y={h['y']}" for h in holds])
+
+    message = openai_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{
+            "role": "user",
+            "content": f"""Based on these climbing route instructions, extract the exact sequence of moves as a JSON array.
+
+ROUTE INSTRUCTIONS:
+{instructions}
+
+AVAILABLE HOLDS:
+{hold_info}
+
+Return ONLY a JSON array with no extra text, no markdown, no code blocks. Each item should have:
+- "move_number": the step number
+- "limb": one of "right hand", "left hand", "right foot", "left foot", "both hands", "both feet", "flag right foot", "flag left foot"
+- "hold": the hold number as an integer, or null if flagging against the wall
+- "action": one of "move", "match", "flag", "start"
+
+Example format:
+[
+  {{"move_number": 1, "limb": "both hands", "hold": 5, "action": "start"}},
+  {{"move_number": 2, "limb": "right hand", "hold": 6, "action": "move"}},
+  {{"move_number": 3, "limb": "left hand", "hold": 6, "action": "match"}}
+]"""
+        }]
+    )
+
+    raw = message.choices[0].message.content.strip()
+    
+    # Clean up in case AI adds markdown
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    
+    import json
+    sequence = json.loads(raw)
+    return sequence
+
+def draw_move_overlay(base_image, holds, sequence, current_step):
+    hold_map = {h["number"]: h for h in holds}
+    image = base_image.copy()
+    draw = ImageDraw.Draw(image)
+
+    COLOURS = {
+        "right hand": "#00ff88",
+        "left hand":  "#00ff88",
+        "both hands": "#00ff88",
+        "right foot": "#4488ff",
+        "left foot":  "#4488ff",
+        "both feet":  "#4488ff",
+        "flag right foot": "#ffcc00",
+        "flag left foot":  "#ffcc00",
+    }
+
+    # Draw all previous moves as small dim circles
+    for i, move in enumerate(sequence[:current_step]):
+        if move["hold"] is None:
+            continue
+        hold_num = move["hold"]
+        if hold_num not in hold_map:
+            continue
+        hx, hy = hold_map[hold_num]["x"], hold_map[hold_num]["y"]
+        colour = COLOURS.get(move["limb"], "#ffffff")
+        draw.ellipse([hx-18, hy-18, hx+18, hy+18], outline=colour, width=2)
+
+    # Draw current move as large bright highlighted circle
+    current_move = sequence[current_step]
+    if current_move["hold"] is not None:
+        hold_num = current_move["hold"]
+        if hold_num in hold_map:
+            hx, hy = hold_map[hold_num]["x"], hold_map[hold_num]["y"]
+            colour = COLOURS.get(current_move["limb"], "#ffffff")
+
+            # Outer glow ring
+            draw.ellipse([hx-35, hy-35, hx+35, hy+35], outline=colour, width=2)
+            # Inner filled circle
+            draw.ellipse([hx-25, hy-25, hx+25, hy+25], fill=colour)
+            # Move number
+            draw.text((hx-8, hy-10), str(current_move["move_number"]), fill="black")
+
+    return image
+
 
 # ---- UI ----
 
@@ -295,7 +379,6 @@ with col4:
         height=100)
 
 if uploaded_file is not None:
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
@@ -309,8 +392,11 @@ if uploaded_file is not None:
             st.session_state["holds"] = holds
             st.session_state["tmp_path"] = tmp_path
             st.session_state["start_holds"] = []
+            st.session_state.pop("sequence", None)
+            st.session_state.pop("instructions", None)
+            st.session_state["current_step"] = 0
 
-    if "annotated_image" in st.session_state and st.session_state["holds"]:
+    if "annotated_image" in st.session_state and st.session_state.get("holds"):
         holds = st.session_state["holds"]
         annotated_image = st.session_state["annotated_image"]
 
@@ -323,12 +409,10 @@ if uploaded_file is not None:
         """, unsafe_allow_html=True)
 
         from streamlit_image_coordinates import streamlit_image_coordinates
-
         value = streamlit_image_coordinates(annotated_image, key="hold_click")
 
-        if value is not None:
+        if value is not None and "sequence" not in st.session_state:
             click_x, click_y = value["x"], value["y"]
-
             closest_hold = None
             closest_dist = float("inf")
             for h in holds:
@@ -338,16 +422,21 @@ if uploaded_file is not None:
                     closest_hold = h
 
             if closest_hold and closest_dist < 40:
+                last_click = st.session_state.get("last_click", None)
+                new_click = (value["x"], value["y"])
+        
+            if last_click == new_click:
+                pass  # ignore duplicate clicks
+            else:
+                st.session_state["last_click"] = new_click
                 start_holds = st.session_state.get("start_holds", [])
                 hold_nums = [h["number"] for h in start_holds]
-
                 if closest_hold["number"] in hold_nums:
                     start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
                     st.toast(f"Deselected Hold {closest_hold['number']}")
                 else:
                     start_holds.append(closest_hold)
                     st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
-
                 st.session_state["start_holds"] = start_holds
 
         current_start_holds = st.session_state.get("start_holds", [])
@@ -361,30 +450,81 @@ if uploaded_file is not None:
 
         if st.button("📋 Generate Route Instructions", use_container_width=True):
             current_start_holds = st.session_state.get("start_holds", [])
-        if not current_start_holds:
-            st.warning("Please click on the start holds in the image before generating instructions.")
+            if not current_start_holds:
+                st.warning("Please click on the start holds in the image before generating instructions.")
+            else:
+                with st.spinner("Generating route instructions..."):
+                    image = Image.open(st.session_state["tmp_path"])
+                    image_width, image_height = image.size
+
+                    graph = build_reachability_graph(
+                        st.session_state["holds"],
+                        image_height,
+                        image_width,
+                        height_cm
+                    )
+
+                    start_hold_numbers = [h["number"] for h in current_start_holds]
+                    graph_description = format_graph_for_prompt(
+                        graph, st.session_state["holds"], start_hold_numbers
+                    )
+
+                    instructions = get_route_instructions(
+                        st.session_state["tmp_path"], colour, difficulty, height_cm,
+                        st.session_state["holds"], wall_angle, start_style, finish_style,
+                        extra_notes, current_start_holds, graph_description
+                    )
+                    st.session_state["instructions"] = instructions
+
+                with st.spinner("Building step by step overlay..."):
+                    sequence = get_structured_sequence(instructions, st.session_state["holds"])
+                    st.session_state["sequence"] = sequence
+                    st.session_state["current_step"] = 0
+                    st.session_state["base_image"] = st.session_state["annotated_image"]
+
+    # ---- Show instructions and overlay from session state ----
+    if "instructions" in st.session_state:
+        st.markdown("### 📋 Route Breakdown")
+        st.markdown(st.session_state["instructions"])
+        st.divider()
+
+    if "sequence" in st.session_state and st.session_state["sequence"]:
+        sequence = st.session_state["sequence"]
+        current_step = st.session_state.get("current_step", 0)
+
+        st.markdown("### 🎬 Step by Step Overlay")
+        st.caption("Walk through each move on the wall.")
+
+        overlay_image = draw_move_overlay(
+            st.session_state["base_image"],
+            st.session_state["holds"],
+            sequence,
+            current_step
+        )
+
+        current_move = sequence[current_step]
+        limb = current_move["limb"]
+        hold = current_move["hold"]
+        action = current_move["action"]
+
+        if hold:
+            st.info(f"**Move {current_step + 1}/{len(sequence)}:** {action.capitalize()} {limb} → Hold {hold}")
         else:
-            with st.spinner("Generating route instructions..."):
-                image = Image.open(st.session_state["tmp_path"])
-                image_width, image_height = image.size
+            st.info(f"**Move {current_step + 1}/{len(sequence)}:** Flag {limb} against the wall")
 
-                graph = build_reachability_graph(
-                    st.session_state["holds"],
-                    image_height,
-                    image_width,
-                    height_cm
-                )
+        st.image(overlay_image, use_column_width=True)
 
-                start_hold_numbers = [h["number"] for h in current_start_holds]
-                graph_description = format_graph_for_prompt(graph, st.session_state["holds"], start_hold_numbers)
+        col_prev, col_next = st.columns(2)
+        with col_prev:
+            if st.button("⬅ Previous Move", use_container_width=True):
+                if st.session_state["current_step"] > 0:
+                    st.session_state["current_step"] -= 1
+                    st.rerun()
+        with col_next:
+            if st.button("Next Move ➡", use_container_width=True):
+                if st.session_state["current_step"] < len(sequence) - 1:
+                    st.session_state["current_step"] += 1
+                    st.rerun()
 
-                instructions = get_route_instructions(
-                    st.session_state["tmp_path"], colour, difficulty, height_cm,
-                    st.session_state["holds"], wall_angle, start_style, finish_style, extra_notes,
-                    current_start_holds, graph_description
-                )
-
-            st.markdown("### 📋 Route Breakdown")
-            st.markdown(instructions)
-            st.divider()
-            st.caption("ClimbAI — helping climbers of all levels get through plateaus 🧗")
+st.divider()
+st.caption("ClimbAI — helping climbers of all levels get through plateaus 🧗")
