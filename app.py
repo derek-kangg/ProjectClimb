@@ -1,3 +1,5 @@
+from route_graph import build_reachability_graph, format_graph_for_prompt
+from PIL import Image
 import streamlit as st
 from openai import OpenAI
 from PIL import Image, ImageDraw
@@ -58,7 +60,15 @@ def detect_holds_by_colour(image_path, colour, min_area=80):
 
         cx, cy = x + w // 2, y + h // 2
 
-        holds.append({"number": hold_number, "x": cx, "y": cy})
+        area = cv2.contourArea(contour)
+        if area < 500:
+            size = "small (likely foothold)"
+        elif area < 2000:
+            size = "medium (likely handhold)"
+        else:
+            size = "large (likely handhold)"
+
+        holds.append({"number": hold_number, "x": cx, "y": cy, "size": size})
 
         draw.rectangle([x, y, x + w, y + h], outline="#6fcf4a", width=3)
         draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#6fcf4a")
@@ -71,12 +81,18 @@ def build_holds_description(holds):
     if not holds:
         return "No holds detected."
     sorted_holds = sorted(holds, key=lambda h: h["y"], reverse=True)
+
+    all_x = [h["x"] for h in holds]
+    mid_x = (max(all_x) + min(all_x)) / 2
+
     lines = ["Holds listed from bottom to top of the wall:"]
     for h in sorted_holds:
-        lines.append(f"Hold {h['number']}: position x={h['x']}, y={h['y']}")
+        size = h.get("size", "unknown")
+        side = "LEFT side of wall" if h["x"] < mid_x else "RIGHT side of wall"
+        lines.append(f"Hold {h['number']}: position x={h['x']}, y={h['y']}, size={size}, wall position={side}")
     return "\n".join(lines)
 
-def get_route_instructions(image_path, colour, difficulty, height_cm, holds, wall_angle, start_style, finish_style, extra_notes, start_holds):
+def get_route_instructions(image_path, colour, difficulty, height_cm, holds, wall_angle, start_style, finish_style, extra_notes, start_holds, graph_description):
     with open(image_path, "rb") as f:
         image_data = base64.b64encode(f.read()).decode("utf-8")
 
@@ -107,12 +123,18 @@ def get_route_instructions(image_path, colour, difficulty, height_cm, holds, wal
     }
 
     extra = f"\nExtra notes from the climber: {extra_notes}" if extra_notes.strip() else ""
+    start_hold_numbers = [h["number"] for h in start_holds]
 
     start_hold_nums = [str(h["number"]) for h in start_holds]
     if len(start_holds) == 1:
-        start_holds_text = f"The climber has confirmed the START hold is: Hold {start_hold_nums[0]}. The climber begins with BOTH hands on this single hold."
+        h = start_holds[0]
+        start_holds_text = f"The climber has confirmed the START hold is: Hold {h['number']} at x={h['x']}, y={h['y']}. The climber begins with BOTH hands on this single hold."
     else:
-        start_holds_text = f"The climber has confirmed the START holds are: Hold {', Hold '.join(start_hold_nums)}. The climber begins with one hand on each hold."
+        start_holds_text = f"The climber has confirmed the START holds are: "
+        for h in start_holds:
+            start_holds_text += f"Hold {h['number']} at x={h['x']}, y={h['y']}, "
+        start_holds_text += "The climber begins with one hand on each hold. "
+        start_holds_text += "For feet: find the two lowest holds of the route. The hold with the LOWER x coordinate should have the LEFT foot. The hold with the HIGHER x coordinate should have the RIGHT foot."
 
     message = openai_client.chat.completions.create(
         model="gpt-4o",
@@ -125,7 +147,7 @@ def get_route_instructions(image_path, colour, difficulty, height_cm, holds, wal
                 },
                 {
                     "type": "text",
-                    "text": f"""You are an expert rock climbing coach analyzing a bouldering wall photo.
+                    "text": f"""You are an expert rock climbing coach specializing in bouldering beta. Analyze this climbing wall photo carefully.
 
 CLIMBER INFO:
 - Height: {height_cm}cm
@@ -142,30 +164,86 @@ DETECTED {colour.upper()} HOLDS (numbered on the image):
 {holds_description}
 Hold numbers present: {hold_list}
 
+{graph_description}
+
+HOLD USAGE RULES:
+- Holds marked as "small (likely foothold)" should NEVER be suggested as handholds
+- Only use small holds for feet
+- Large and medium holds can be used for both hands and feet
+- Always place feet before suggesting the next hand move
+- Always suggest flagging when there is no obvious foothold available
+
+COORDINATE SYSTEM — very important for left/right assignment:
+- x increases from LEFT to RIGHT of the image
+- y increases from TOP to BOTTOM, so LOW y = higher on the wall
+- CRITICAL: Left/right hand assignment is RELATIVE to the climber's current position, not the absolute wall center
+- If the target hold has a HIGHER x than the climber's current hand position, use the RIGHT hand
+- If the target hold has a LOWER x than the climber's current hand position, use the LEFT hand
+- For feet: if the target hold has a HIGHER x than the climber's current body center, use the RIGHT foot. If LOWER x, use the LEFT foot
+- Example: if both hands are on Hold 5 (x=259) and Hold 6 is at x=371, Hold 6 is to the RIGHT so use RIGHT hand
+- LEADING HAND RULE: When moving to a hold that is to the RIGHT of current hand position, the RIGHT hand moves first. When moving to a hold to the LEFT of current hand position, the LEFT hand moves first. Only after the leading hand is placed should you match the other hand.
+- HAND MOVEMENT RULE: After the leading hand moves to a new hold, choose the most logical next action based on hold positions:
+  1. MATCH — bring the other hand to the same hold. Best when the next target hold is far away or when balance needs to be established first.
+  2. STAY — keep the other hand where it is and move a foot or flag instead. Best when the next hold is within easy reach.
+  3. MOVE TO DIFFERENT HOLD — move the other hand to a separate hold. Best when there is a logical hold nearby that improves balance or position.
+- Always choose whichever option makes the most physical sense given the hold positions and the climber's balance.
+
+CRITICAL CLIMBING KNOWLEDGE — apply all of this:
+
+MATCHING:
+- Matching means placing both hands on the same hold before moving one hand to the next hold
+- On slab walls, matching is extremely common — climbers match hands on almost every hold to establish balance before the next move
+- Always consider whether matching is needed before each move, especially on slab
+- When a climber matches, write it as a separate step: "Match left hand to Hold X"
+
+FLAGGING:
+- Flagging means extending one leg against the wall (not on a hold) for balance
+- It is one of the most common techniques on slab and slight overhang
+- Suggest flagging whenever there is no obvious foothold available for the next move
+- Specify which leg flags and where against the wall: e.g. "Flag right foot against the wall to the right for balance"
+- Flagging is often used immediately after moving a foot, before the next hand move
+
+SLAB RHYTHM:
+- On a slab the rhythm is: establish feet → match hands → flag if needed → reach next hold → match → move feet → repeat
+- Never suggest moving two limbs at once
+- Always establish balance before suggesting the next hand move
+- Prioritize foot movement and flagging to maintain balance throughout
+
+FOOTWORK:
+- Holds marked as "small (likely foothold)" are probably footholds but ANY hold can be used as a foothold
+- Holds marked as "large (likely handhold)" are likely handholds
+- On slab, feet drive the climb — always think about foot placement before hand placement
+- After each hand move, consider whether a foot needs to move or flag before the next hand move
+
+SEQUENCE LOGIC:
+- Work out the most logical sequence from bottom to top
+- Only suggest moves to holds that are realistically reachable from the current position
+- Consider the climber's height of {height_cm}cm — can they reach the next hold without moving feet first?
+- The most efficient beta usually involves matching on holds that are central or far from the next target
+
 INSTRUCTIONS:
-As you analyze the image, also identify the types of holds you see (crimps, jugs, slopers, pinches, pockets etc) and factor this into your advice.
+As you analyze the image, identify the types of holds you see (crimps, jugs, slopers, pinches, pockets etc) and factor this into your advice.
 
 Provide a route breakdown with:
 
 1. **Route Overview:** Difficulty, style, and what makes this route challenging or accessible for a {height_cm}cm {difficulty} climber on a {wall_angle} wall.
 
-2. **Hold Types Identified:** List the hold types you can see and briefly explain how to grip each one.
+2. **Hold Types Identified:** List each detected hold number, its type, and how to grip it.
 
-3. **Starting Position:** Based on the confirmed start holds, describe exact hand and foot placement using hold numbers.
+3. **Starting Position:** Based on the confirmed start holds, describe exact hand and foot placement.
 
-4. **Step by Step Moves:** For each move:
+4. **Step by Step Moves:** For EVERY move including matches and flags:
    - Which hold number, which hand or foot
-   - Only suggest moves to realistically reachable holds
-   - Body positioning for a {wall_angle} wall specifically
+   - Whether this is a match, a flag, or a new hold
+   - Body positioning specific to {wall_angle} wall
    - Technique with simple explanation in brackets
-   - Height note if relevant for this specific move
    - Difficulty: Easy / Medium / Hard
 
-5. **Finishing Move:** How to reach and complete the finish based on ({finish_style}).
+5. **Finishing Move:** How to reach and complete the finish.
 
-6. **Key Tips:** 3 tips specific to this route, this wall angle, and this climber.
+6. **Key Tips:** 3 tips specific to this route, wall angle, and climber level.
 
-Always reference holds by number. Tailor ALL advice to the {wall_angle} wall type."""
+Always reference holds by number. Never skip matches or flags — they are as important as the main moves."""
                 }
             ]
         }]
@@ -287,11 +365,24 @@ if uploaded_file is not None:
             st.warning("Please click on the start holds in the image before generating instructions.")
         else:
             with st.spinner("Generating route instructions..."):
+                image = Image.open(st.session_state["tmp_path"])
+                image_width, image_height = image.size
+
+                graph = build_reachability_graph(
+                    st.session_state["holds"],
+                    image_height,
+                    image_width,
+                    height_cm
+                )
+
+                start_hold_numbers = [h["number"] for h in current_start_holds]
+                graph_description = format_graph_for_prompt(graph, st.session_state["holds"], start_hold_numbers)
+
                 instructions = get_route_instructions(
-                st.session_state["tmp_path"], colour, difficulty, height_cm,
-                st.session_state["holds"], wall_angle, start_style, finish_style, extra_notes,
-                current_start_holds
-            )
+                    st.session_state["tmp_path"], colour, difficulty, height_cm,
+                    st.session_state["holds"], wall_angle, start_style, finish_style, extra_notes,
+                    current_start_holds, graph_description
+                )
 
             st.markdown("### 📋 Route Breakdown")
             st.markdown(instructions)
