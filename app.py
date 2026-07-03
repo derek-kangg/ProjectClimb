@@ -1,18 +1,27 @@
 from route_graph import build_reachability_graph, format_graph_for_prompt
-from PIL import Image
-import streamlit as st
-from openai import OpenAI
 from PIL import Image, ImageDraw
+import streamlit as st
+import anthropic
 from dotenv import load_dotenv
 import cv2
 import numpy as np
 import os
 import base64
 import tempfile
+import io
 
 load_dotenv()
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def get_api_key():
+    key = os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        try:
+            key = st.secrets["ANTHROPIC_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            key = None
+    return key
+
+anthropic_client = anthropic.Anthropic(api_key=get_api_key())
 
 COLOUR_RANGES = {
     "Black":  [(0, 0, 0),      (180, 80, 50)],
@@ -26,288 +35,548 @@ COLOUR_RANGES = {
     "Purple": [(130, 50, 50),  (160, 255, 255)],
 }
 
-def detect_holds_by_colour(image_path, colour, min_area=80):
+
+def detect_and_validate_holds(image_path, colour):
+    """
+    Two-pass hold detection:
+    Pass 1 — OpenCV finds candidates by colour (pixel-accurate coordinates).
+    Pass 2 — Claude Sonnet sees the annotated image, removes false positives,
+              and identifies hold types. All in one vision call.
+    Returns: (annotated PIL image, validated holds list with hold_type / best_use)
+    """
+    # --- Pass 1: OpenCV colour detection ---
     cv_image = cv2.imread(image_path)
     hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-
     low, high = COLOUR_RANGES[colour]
     mask = cv2.inRange(hsv, np.array(low), np.array(high))
-
     kernel = np.ones((5, 5), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    pil_image = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(pil_image)
-
-    holds = []
-    hold_number = 1
-
+    candidates = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < min_area:
+        if area < 80:
             continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        if w < 12 or h < 12:
+        bx, by, bw, bh = cv2.boundingRect(contour)
+        if bw < 12 or bh < 12:
             continue
-
-        if y < cv_image.shape[0] * 0.03:
+        if by < cv_image.shape[0] * 0.03:
             continue
+        cx, cy = bx + bw // 2, by + bh // 2
+        size = "small" if area < 500 else "medium" if area < 2000 else "large"
+        candidates.append({"bx": bx, "by": by, "bw": bw, "bh": bh, "x": cx, "y": cy, "size": size})
 
-        cx, cy = x + w // 2, y + h // 2
+    if not candidates:
+        return Image.open(image_path).convert("RGB"), []
 
-        area = cv2.contourArea(contour)
-        if area < 500:
-            size = "small (likely foothold)"
-        elif area < 2000:
-            size = "medium (likely handhold)"
+    # Draw numbered candidates on a preview image for Claude to assess
+    preview = Image.open(image_path).convert("RGB")
+    preview_draw = ImageDraw.Draw(preview)
+    for i, c in enumerate(candidates, 1):
+        cx, cy = c["x"], c["y"]
+        preview_draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#6fcf4a")
+        preview_draw.text((cx-5, cy-8), str(i), fill="black")
+
+    buf = io.BytesIO()
+    preview.save(buf, format="JPEG")
+    image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    candidate_list = "\n".join(
+        f"Candidate {i}: x={c['x']}, y={c['y']}, size={c['size']}"
+        for i, c in enumerate(candidates, 1)
+    )
+
+    # --- Pass 2: Claude validation ---
+    tool = {
+        "name": "submit_validated_holds",
+        "description": "Submit validation results for each detected hold candidate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "holds": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "number":    {"type": "integer"},
+                            "hold_type": {"type": "string", "enum": ["jug", "crimp", "sloper", "pinch", "pocket", "edge", "volume", "chip", "unknown"]},
+                            "best_use":  {"type": "string", "enum": ["handhold", "foothold", "both"]}
+                        },
+                        "required": ["number", "hold_type", "best_use"]
+                    }
+                }
+            },
+            "required": ["holds"]
+        }
+    }
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        tools=[tool],
+        tool_choice={"type": "any"},
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
+                {"type": "text", "text": f"""This climbing wall image has {len(candidates)} numbered candidate holds detected by colour analysis (target colour: {colour}).
+
+{candidate_list}
+
+For every candidate number, identify:
+1. Hold type: jug / crimp / sloper / pinch / pocket / edge / volume / chip
+2. Best use: handhold, foothold, or both (small chips are typically footholds)
+
+Assess every single candidate — do not skip any."""}
+            ]
+        }]
+    )
+
+    validated = {}
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "submit_validated_holds":
+            for h in block.input["holds"]:
+                validated[h["number"]] = h
+            break
+
+    # Build final holds list and annotated image
+    final_image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(final_image)
+    final_holds = []
+    new_number = 1
+
+    for i, c in enumerate(candidates, 1):
+        v = validated.get(i, {"hold_type": "unknown", "best_use": "both"})
+
+        cx, cy = c["x"], c["y"]
+        bx, by, bw, bh = c["bx"], c["by"], c["bw"], c["bh"]
+        best_use  = v.get("best_use", "both")
+        hold_type = v.get("hold_type", "unknown")
+
+        if best_use == "foothold" or c["size"] == "small":
+            size_label = "small (likely foothold)"
+        elif c["size"] == "large":
+            size_label = "large (likely handhold)"
         else:
-            size = "large (likely handhold)"
+            size_label = "medium (likely handhold)"
 
-        holds.append({"number": hold_number, "x": cx, "y": cy, "size": size})
+        final_holds.append({
+            "number":    new_number,
+            "x":         cx,
+            "y":         cy,
+            "size":      size_label,
+            "hold_type": hold_type,
+            "best_use":  best_use,
+        })
 
-        draw.rectangle([x, y, x + w, y + h], outline="#6fcf4a", width=3)
+        draw.rectangle([bx, by, bx + bw, by + bh], outline="#6fcf4a", width=3)
         draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#6fcf4a")
-        draw.text((cx-5, cy-8), str(hold_number), fill="black")
-        hold_number += 1
+        draw.text((cx-5, cy-8), str(new_number), fill="black")
+        new_number += 1
 
-    return pil_image, holds
+    return final_image, final_holds
+
 
 def build_holds_description(holds):
     if not holds:
         return "No holds detected."
     sorted_holds = sorted(holds, key=lambda h: h["y"], reverse=True)
-
     all_x = [h["x"] for h in holds]
     mid_x = (max(all_x) + min(all_x)) / 2
 
-    lines = ["Holds listed from bottom to top of the wall:"]
+    lines = ["Holds listed bottom to top:"]
     for h in sorted_holds:
-        size = h.get("size", "unknown")
-        side = "LEFT side of wall" if h["x"] < mid_x else "RIGHT side of wall"
-        lines.append(f"Hold {h['number']}: position x={h['x']}, y={h['y']}, size={size}, wall position={side}")
+        side      = "LEFT" if h["x"] < mid_x else "RIGHT"
+        hold_type = h.get("hold_type", "unknown")
+        best_use  = h.get("best_use", "both")
+        size      = h.get("size", "unknown")
+        lines.append(
+            f"Hold {h['number']}: {hold_type}, {size}, {side} side, best_use={best_use}, x={h['x']}, y={h['y']}"
+        )
     return "\n".join(lines)
 
-def get_route_instructions(image_path, colour, difficulty, height_cm, holds, wall_angle, start_style, finish_style, extra_notes, start_holds, graph_description):
-    with open(image_path, "rb") as f:
-        image_data = base64.b64encode(f.read()).decode("utf-8")
 
-    holds_description = build_holds_description(holds)
-    hold_numbers = [str(h["number"]) for h in holds]
-    hold_list = ", ".join(hold_numbers)
+def apply_limb_to_state(new_state, limb, hold):
+    """Apply a single limb placement to state dict in place."""
+    if limb == "right hand":
+        new_state["RH"] = hold
+    elif limb == "left hand":
+        new_state["LH"] = hold
+    elif limb == "both hands":
+        new_state["RH"] = hold
+        new_state["LH"] = hold
+    elif limb == "right foot":
+        new_state["RF"] = hold
+        if hold is not None and new_state["LF"] == hold:
+            new_state["LF"] = None
+    elif limb == "left foot":
+        new_state["LF"] = hold
+        if hold is not None and new_state["RF"] == hold:
+            new_state["RF"] = None
+    elif limb == "both feet":
+        new_state["RF"] = hold
+        new_state["LF"] = hold
+    elif limb == "swap right foot":
+        new_state["RF"] = hold
+        new_state["LF"] = None
+    elif limb == "swap left foot":
+        new_state["LF"] = hold
+        new_state["RF"] = None
+    elif limb in ("smear right foot", "flag right foot"):
+        new_state["RF"] = None
+    elif limb in ("smear left foot", "flag left foot"):
+        new_state["LF"] = None
+
+
+def apply_move_to_state(state, move):
+    """Apply a move to the body state dict."""
+    new_state = state.copy()
+    apply_limb_to_state(new_state, move["limb"], move["hold"])
+    return new_state
+
+
+def format_state(state):
+    def fmt(v):
+        return f"Hold {v}" if v is not None else "wall/air"
+    return f"LH: {fmt(state['LH'])} | RH: {fmt(state['RH'])} | LF: {fmt(state['LF'])} | RF: {fmt(state['RF'])}"
+
+
+def generate_sequence_iteratively(
+    hold_descriptions, holds, graph, start_holds,
+    height_cm, difficulty, wall_angle, finish_style, extra_notes,
+    progress_callback=None
+):
+    """
+    Generate a route sequence one move at a time.
+    Python tracks body state; the model only picks the next single move.
+    """
+    MAX_MOVES = 20
+    hold_map = {h["number"]: h for h in holds}
+    finish_hold_num = min(holds, key=lambda h: h["y"])["number"]
+
+    # Auto-place starting feet on the lowest available holds near the start holds.
+    # Prefer holds below (higher y) and near the x position of the start hands.
+    start_x = sum(h["x"] for h in start_holds) / len(start_holds)
+    start_y = max(h["y"] for h in start_holds)  # y of lowest start hand hold
+    start_hand_nums = {h["number"] for h in start_holds}
+
+    foot_candidates = sorted(
+        [h for h in holds if h["y"] >= start_y - 30 and h["number"] not in start_hand_nums],
+        key=lambda h: (-h["y"], abs(h["x"] - start_x))
+    )
+
+    lf_hold = foot_candidates[0]["number"] if len(foot_candidates) > 0 else None
+    rf_hold = foot_candidates[1]["number"] if len(foot_candidates) > 1 else None
+
+    if len(start_holds) == 1:
+        state = {"LH": start_holds[0]["number"], "RH": start_holds[0]["number"], "LF": lf_hold, "RF": rf_hold}
+        foot_cue = f"LF Hold {lf_hold}, RF {'Hold ' + str(rf_hold) if rf_hold else 'smear'}"
+        start_cue = f"Both hands Hold {start_holds[0]['number']}, {foot_cue}"
+        start_move = {"move_number": 0, "limb": "both hands", "hold": start_holds[0]["number"], "action": "start", "cue": start_cue}
+    else:
+        state = {"LH": start_holds[0]["number"], "RH": start_holds[1]["number"], "LF": lf_hold, "RF": rf_hold}
+        foot_cue = f"LF Hold {lf_hold}, RF {'Hold ' + str(rf_hold) if rf_hold else 'smear'}"
+        start_cue = f"LH Hold {start_holds[0]['number']}, RH Hold {start_holds[1]['number']}, {foot_cue}"
+        start_move = {"move_number": 0, "limb": "both hands", "hold": None, "action": "start", "cue": start_cue}
+
+    sequence = [start_move]
 
     angle_context = {
-        "Slab (less than vertical)": "This is a SLAB wall (less than vertical). Key advice: weight must be over feet at all times, trust your shoes, stand tall and avoid pulling with arms, balance and precise footwork are everything. Slipping off a slab usually means your weight shifted back.",
-        "Vertical": "This is a VERTICAL wall. Key advice: keep arms straight to conserve energy, balance arm and leg use equally, look for resting positions where you can shake out.",
-        "Slight overhang": "This is a SLIGHT OVERHANG. Key advice: keep hips close to the wall, start thinking about grip endurance, use momentum where possible, feet are still very important.",
-        "Steep overhang": "This is a STEEP OVERHANG. Key advice: body tension is critical, keep feet on the wall at all times, move efficiently and quickly to conserve grip strength, technique matters more than raw strength here.",
-        "Roof": "This is a ROOF (near horizontal). Key advice: maximum body tension required, heel hooks and toe hooks are essential, every move costs significant energy so plan ahead, core strength is critical."
+        "Slab (less than vertical)": "slab — trust feet, stand tall, smearing common",
+        "Vertical": "vertical — balance arm and leg use equally",
+        "Slight overhang": "slight overhang — hips close to wall, feet still important",
+        "Steep overhang": "steep overhang — body tension critical, move efficiently",
+        "Roof": "roof — heel hooks, toe hooks, core tension essential",
     }
-
-    start_context = {
-        "START label": "The starting holds are marked with a START label.",
-        "Tape on hold": "The starting holds are marked with tape. Look for taped holds at the bottom of the route.",
-        "Two hands on lowest holds": "There is no start marker — the climber begins with both hands on the two lowest holds of the route.",
-        "Not marked": "There is no start marker — use the lowest holds of the route to begin."
-    }
-
     finish_context = {
-        "TOP label": "The finishing hold is marked with a TOP label.",
-        "Tape on hold": "The finishing hold is marked with tape.",
-        "Top-out (both hands on top)": "To finish, the climber must get both hands on the very top of the wall.",
-        "Not marked": "There is no finish marker — the route ends at the highest hold of the colour."
+        "TOP label":                    "marked TOP",
+        "Tape on hold":                 "marked with tape",
+        "Top-out (both hands on top)":  "top-out, both hands on wall top",
+        "Not marked":                   "highest hold of this colour",
+    }
+    extra = f"\nExtra notes: {extra_notes}" if extra_notes.strip() else ""
+
+    hold_positions = "\n".join(
+        f"Hold {h['number']}: x={h['x']}, y={h['y']}, size={h['size']}, type={h.get('hold_type','?')}, use={h.get('best_use','both')}"
+        for h in sorted(holds, key=lambda x: x["y"], reverse=True)
+    )
+
+    move_tool = {
+        "name": "submit_move",
+        "description": "Submit the single best next climbing move given the current body state. A move can include a simultaneous foot adjustment when the hand move naturally requires it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limb": {
+                    "type": "string",
+                    "enum": [
+                        "right hand", "left hand", "both hands",
+                        "right foot", "left foot", "both feet",
+                        "flag right foot", "flag left foot",
+                        "smear right foot", "smear left foot",
+                        "swap right foot", "swap left foot"
+                    ]
+                },
+                "hold": {
+                    "type": ["integer", "null"],
+                    "description": "Hold number, or null for smear/flag against wall"
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["move", "match", "flag", "smear", "swap", "heel hook", "toe hook", "drop knee", "deadpoint", "dynamic", "finish"]
+                },
+                "cue": {
+                    "type": "string",
+                    "description": "One short technique cue under 10 words"
+                }
+            },
+            "required": ["limb", "hold", "action", "cue"]
+        }
     }
 
-    extra = f"\nExtra notes from the climber: {extra_notes}" if extra_notes.strip() else ""
-    start_hold_numbers = [h["number"] for h in start_holds]
+    for move_num in range(1, MAX_MOVES + 1):
+        if progress_callback:
+            progress_callback(move_num, MAX_MOVES)
 
-    start_hold_nums = [str(h["number"]) for h in start_holds]
-    if len(start_holds) == 1:
-        h = start_holds[0]
-        start_holds_text = f"The climber has confirmed the START hold is: Hold {h['number']} at x={h['x']}, y={h['y']}. The climber begins with BOTH hands on this single hold."
-    else:
-        start_holds_text = f"The climber has confirmed the START holds are: "
-        for h in start_holds:
-            start_holds_text += f"Hold {h['number']} at x={h['x']}, y={h['y']}, "
-        start_holds_text += "The climber begins with one hand on each hold. "
-        start_holds_text += "For feet: find the two lowest holds of the route. The hold with the LOWER x coordinate should have the LEFT foot. The hold with the HIGHER x coordinate should have the RIGHT foot."
+        def reachable_str(hold_num):
+            if hold_num is None:
+                return "none"
+            entries = graph.get(hold_num, [])
+            if not entries:
+                return "none in reach"
+            return ", ".join(
+                f"Hold {r['hold']} ({r['difficulty']}, {r['direction']})"
+                for r in entries[:8]
+            )
 
-    message = openai_client.chat.completions.create(
-        model="gpt-4o",
+        history = "\n".join(
+            f"  {m['move_number']}: {m['limb']} → {'Hold ' + str(m['hold']) if m['hold'] is not None else 'wall'} ({m['action']}) — {m.get('cue', '')}"
+            for m in sequence
+        )
+
+        if difficulty == "Beginner":
+            technique_section = """TECHNIQUE LIBRARY (low-grade climb — keep it simple and controlled):
+  Footwork: step onto hold | flag for balance | smear on slab | foot swap when needed
+  Hands: match when repositioning is needed
+  Movement: static moves only — no jumping or lunging
+  Avoid heel hooks, toe hooks, drop knees, and dynamic moves unless the hold layout makes them unavoidable."""
+        elif difficulty == "Intermediate":
+            technique_section = """TECHNIQUE LIBRARY (intermediate grade — use technique when it clearly helps):
+  Footwork: step onto hold | backstep (outside edge, hip in) | flag (inside/outside) | heel hook on obvious placements | smear | foot swap
+  Hands: match | side pull | undercling
+  Movement: deadpoint if a hold is just out of static reach
+  Use advanced moves (drop knee, toe hook) only when the geometry clearly calls for it."""
+        else:
+            technique_section = """TECHNIQUE LIBRARY (advanced/high-grade climb — full repertoire expected):
+  Footwork: step | heel hook (heel on/above hold, pull with hamstring) | toe hook (top of foot, pull) | drop knee (rotate knee in, hip drops, extends reach) | backstep (outside edge, hip turned in) | foot swap
+  Balance: inside flag | outside flag | smear
+  Movement: deadpoint (lunge, grip at apex) | dynamic (jump when hold is out of static reach)
+  Hands: match | undercling (palm up, pull toward body) | side pull | gaston (elbow out, push away)
+  Drop knees, heel hooks, and flags are expected — use them proactively for better position."""
+
+        prompt = f"""You are generating a bouldering sequence one move at a time.
+
+CURRENT BODY STATE:
+{format_state(state)}
+
+MOVE HISTORY:
+{history}
+
+FINISH: Hold {finish_hold_num} ({finish_context[finish_style]})
+WALL: {angle_context[wall_angle]}
+CLIMBER: {height_cm}cm, {difficulty}{extra}
+
+HOLD INFO (type, size, position):
+{hold_positions}
+
+REACHABLE FROM CURRENT HANDS:
+From LH (Hold {state['LH']}): {reachable_str(state['LH'])}
+From RH (Hold {state['RH']}): {reachable_str(state['RH'])}
+
+REACHABLE FROM CURRENT FEET (for foot moves):
+From LF ({('Hold ' + str(state['LF'])) if state['LF'] else 'wall'}): {reachable_str(state['LF'])}
+From RF ({('Hold ' + str(state['RF'])) if state['RF'] else 'wall'}): {reachable_str(state['RF'])}
+
+MECHANICS:
+- One limb moves per step — always.
+- Two hands CAN share a hold (match)
+- Two feet CANNOT share a small chip — foot swap instead
+- Only move feet to holds in the foot reachable lists above, or smear/flag on wall
+
+FOOT ECONOMY — feet are support, hands drive progress:
+- HANDS make upward progress. Move a hand on most moves.
+- Only move a foot when the current foot position genuinely cannot support the next hand reach.
+- Do NOT move feet proactively or to "prepare" — if feet are stable, leave them and move a hand instead.
+- A pivot foothold (a good mid-height chip) should be reused via swaps as hands climb — do not abandon it for a new one each move.
+- Flag the free foot when one foot is anchored on the pivot — flagging is stable, not a last resort.
+- If in doubt between a foot move and a hand move: move the hand.
+
+{technique_section}
+Only move hands to holds shown in the reachable lists above.
+When a hand reaches Hold {finish_hold_num}, output action=finish.
+
+What is the single best next move?"""
+
+        def request_move(extra_correction=""):
+            messages = [{"role": "user", "content": prompt}]
+            if extra_correction:
+                messages.append({"role": "assistant", "content": [{"type": "text", "text": "I'll reconsider."}]})
+                messages.append({"role": "user", "content": f"CORRECTION NEEDED: {extra_correction} Please submit a different move."})
+            resp = anthropic_client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=256,
+                tools=[move_tool],
+                tool_choice={"type": "any"},
+                messages=messages
+            )
+            for block in resp.content:
+                if block.type == "tool_use" and block.name == "submit_move":
+                    return dict(block.input)
+            return None
+
+        def validate_move(m):
+            """Returns an error string if the move violates a physical rule, else None."""
+            if m is None:
+                return None
+            limb = m.get("limb", "")
+            hold = m.get("hold")
+
+            # Hand must be in reachable list
+            if limb == "right hand" and hold is not None:
+                reachable_nums = [r["hold"] for r in graph.get(state["RH"], [])]
+                if hold not in reachable_nums:
+                    return f"Hold {hold} is not reachable from RH (Hold {state['RH']}). Choose a hold from the reachable list."
+            if limb == "left hand" and hold is not None:
+                reachable_nums = [r["hold"] for r in graph.get(state["LH"], [])]
+                if hold not in reachable_nums:
+                    return f"Hold {hold} is not reachable from LH (Hold {state['LH']}). Choose a hold from the reachable list."
+
+            # Two feet cannot share a small chip
+            if limb in ("right foot", "swap right foot") and hold is not None:
+                other_foot = state["LF"]
+                if other_foot == hold and hold_map.get(hold, {}).get("size", "").startswith("small"):
+                    return f"Both feet cannot share Hold {hold} — it is a small chip. Use foot swap or choose a different hold."
+            if limb in ("left foot", "swap left foot") and hold is not None:
+                other_foot = state["RF"]
+                if other_foot == hold and hold_map.get(hold, {}).get("size", "").startswith("small"):
+                    return f"Both feet cannot share Hold {hold} — it is a small chip. Use foot swap or choose a different hold."
+
+            # Hold must exist
+            if hold is not None and hold not in hold_map:
+                return f"Hold {hold} does not exist on this wall. Choose a valid hold number."
+
+            return None
+
+        # Request move with up to 2 correction attempts
+        move = request_move()
+        for _ in range(2):
+            error = validate_move(move)
+            if error is None:
+                break
+            move = request_move(extra_correction=error)
+
+        if move is None:
+            break
+
+        move["move_number"] = move_num
+
+        # Final guard — skip invalid hold rather than crash
+        if move["hold"] is not None and move["hold"] not in hold_map:
+            break
+
+        state = apply_move_to_state(state, move)
+        sequence.append(move)
+
+        if move["action"] == "finish":
+            break
+        if move["hold"] == finish_hold_num and move["limb"] in ("right hand", "left hand", "both hands"):
+            break
+
+    return sequence
+
+
+def format_sequence_as_text(sequence, hold_descriptions):
+    lines = ["### Route Sequence\n"]
+    for move in sequence:
+        num      = move["move_number"]
+        limb     = move["limb"]
+        hold     = move["hold"]
+        cue      = move.get("cue", "")
+        hold_str = f"Hold {hold}" if hold is not None else "wall"
+
+        if num == 0:
+            lines.append(f"**Start:** {cue}")
+        else:
+            lines.append(f"**Move {num}:** {limb} → {hold_str} — {cue}")
+
+    lines.append("\n---\n### Hold Analysis\n")
+    lines.append(hold_descriptions)
+    return "\n\n".join(lines)
+
+
+def analyze_user_beta(annotated_image, holds, user_beta, height_cm, difficulty, wall_angle):
+    """Rate My Beta: the climber describes their own sequence and gets coaching feedback."""
+    buf = io.BytesIO()
+    annotated_image.save(buf, format="JPEG")
+    image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    holds_description = build_holds_description(holds)
+
+    response = anthropic_client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1500,
+        system="""You are an experienced bouldering coach reviewing a climber's beta (their planned sequence). Be supportive but honest — like a good coach at the gym.
+
+Your feedback should cover:
+1. WHAT WORKS — parts of their beta that are solid, and why
+2. WATCH OUT FOR — risks or inefficiencies (balance issues, skipped feet, over-gripping)
+3. SUGGESTIONS — at most 2-3 concrete improvements, only where they genuinely help. If their beta is good, say so — do not invent problems.
+
+Refer to holds by their numbers. Keep it conversational and under 300 words. Never rewrite their whole sequence — coach the beta they brought you.""",
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}
-                },
-                {
-                    "type": "text",
-                    "text": f"""You are an expert rock climbing coach specializing in bouldering beta. Analyze this climbing wall photo carefully.
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
+                {"type": "text", "text": f"""Here is the climbing wall with numbered holds.
 
-CLIMBER INFO:
-- Height: {height_cm}cm
-- Experience: {difficulty}
-- Max reach between holds: approximately {int(height_cm * 1.3)}cm
-
-WALL INFO:
-- {angle_context[wall_angle]}
-- Start: {start_holds_text}
-- Finish: {finish_context[finish_style]}
-{extra}
-
-DETECTED {colour.upper()} HOLDS (numbered on the image):
 {holds_description}
-Hold numbers present: {hold_list}
 
-{graph_description}
+CLIMBER: {height_cm}cm, {difficulty} level
+WALL: {wall_angle}
 
-HOLD USAGE RULES:
-- Holds marked as "small (likely foothold)" should NEVER be suggested as handholds
-- Only use small holds for feet
-- Large and medium holds can be used for both hands and feet
-- Always place feet before suggesting the next hand move
-- Always suggest flagging when there is no obvious foothold available
+MY BETA:
+{user_beta}
 
-COORDINATE SYSTEM — very important for left/right assignment:
-- x increases from LEFT to RIGHT of the image
-- y increases from TOP to BOTTOM, so LOW y = higher on the wall
-- CRITICAL: Left/right hand assignment is RELATIVE to the climber's current position, not the absolute wall center
-- If the target hold has a HIGHER x than the climber's current hand position, use the RIGHT hand
-- If the target hold has a LOWER x than the climber's current hand position, use the LEFT hand
-- For feet: if the target hold has a HIGHER x than the climber's current body center, use the RIGHT foot. If LOWER x, use the LEFT foot
-- Example: if both hands are on Hold 5 (x=259) and Hold 6 is at x=371, Hold 6 is to the RIGHT so use RIGHT hand
-- LEADING HAND RULE: When moving to a hold that is to the RIGHT of current hand position, the RIGHT hand moves first. When moving to a hold to the LEFT of current hand position, the LEFT hand moves first. Only after the leading hand is placed should you match the other hand.
-- HAND MOVEMENT RULE: After the leading hand moves to a new hold, choose the most logical next action based on hold positions:
-  1. MATCH — bring the other hand to the same hold. Best when the next target hold is far away or when balance needs to be established first.
-  2. STAY — keep the other hand where it is and move a foot or flag instead. Best when the next hold is within easy reach.
-  3. MOVE TO DIFFERENT HOLD — move the other hand to a separate hold. Best when there is a logical hold nearby that improves balance or position.
-- Always choose whichever option makes the most physical sense given the hold positions and the climber's balance.
-
-CRITICAL CLIMBING KNOWLEDGE — apply all of this:
-
-MATCHING:
-- Matching means placing both hands on the same hold before moving one hand to the next hold
-- On slab walls, matching is extremely common — climbers match hands on almost every hold to establish balance before the next move
-- Always consider whether matching is needed before each move, especially on slab
-- When a climber matches, write it as a separate step: "Match left hand to Hold X"
-
-FLAGGING:
-- Flagging means extending one leg against the wall (not on a hold) for balance
-- It is one of the most common techniques on slab and slight overhang
-- Suggest flagging whenever there is no obvious foothold available for the next move
-- Specify which leg flags and where against the wall: e.g. "Flag right foot against the wall to the right for balance"
-- Flagging is often used immediately after moving a foot, before the next hand move
-
-SLAB RHYTHM:
-- On a slab the rhythm is: establish feet → match hands → flag if needed → reach next hold → match → move feet → repeat
-- Never suggest moving two limbs at once
-- Always establish balance before suggesting the next hand move
-- Prioritize foot movement and flagging to maintain balance throughout
-
-FOOTWORK:
-- Holds marked as "small (likely foothold)" are probably footholds but ANY hold can be used as a foothold
-- Holds marked as "large (likely handhold)" are likely handholds
-- On slab, feet drive the climb — always think about foot placement before hand placement
-- After each hand move, consider whether a foot needs to move or flag before the next hand move
-
-SEQUENCE LOGIC:
-- Work out the most logical sequence from bottom to top
-- Only suggest moves to holds that are realistically reachable from the current position
-- Consider the climber's height of {height_cm}cm — can they reach the next hold without moving feet first?
-- The most efficient beta usually involves matching on holds that are central or far from the next target
-
-INSTRUCTIONS:
-As you analyze the image, identify the types of holds you see (crimps, jugs, slopers, pinches, pockets etc) and factor this into your advice.
-
-Provide a route breakdown with:
-
-1. **Route Overview:** Difficulty, style, and what makes this route challenging or accessible for a {height_cm}cm {difficulty} climber on a {wall_angle} wall.
-
-2. **Hold Types Identified:** List each detected hold number, its type, and how to grip it.
-
-3. **Starting Position:** Based on the confirmed start holds, describe exact hand and foot placement.
-
-4. **Step by Step Moves:** For EVERY move including matches and flags:
-   - Which hold number, which hand or foot
-   - Whether this is a match, a flag, or a new hold
-   - Body positioning specific to {wall_angle} wall
-   - Technique with simple explanation in brackets
-   - Difficulty: Easy / Medium / Hard
-
-5. **Finishing Move:** How to reach and complete the finish.
-
-6. **Key Tips:** 3 tips specific to this route, wall angle, and climber level.
-
-Always reference holds by number. Never skip matches or flags — they are as important as the main moves."""
-                }
+Please review my beta."""}
             ]
         }]
     )
-    return message.choices[0].message.content
+    return response.content[0].text
 
-def get_structured_sequence(instructions, holds):
-    hold_map = {h["number"]: h for h in holds}
-    hold_info = ", ".join([f"Hold {h['number']} at x={h['x']}, y={h['y']}" for h in holds])
-
-    message = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{
-            "role": "user",
-            "content": f"""Based on these climbing route instructions, extract the exact sequence of moves as a JSON array.
-
-ROUTE INSTRUCTIONS:
-{instructions}
-
-AVAILABLE HOLDS:
-{hold_info}
-
-Return ONLY a JSON array with no extra text, no markdown, no code blocks. Each item should have:
-- "move_number": the step number
-- "limb": one of "right hand", "left hand", "right foot", "left foot", "both hands", "both feet", "flag right foot", "flag left foot"
-- "hold": the hold number as an integer, or null if flagging against the wall
-- "action": one of "move", "match", "flag", "start"
-
-Example format:
-[
-  {{"move_number": 1, "limb": "both hands", "hold": 5, "action": "start"}},
-  {{"move_number": 2, "limb": "right hand", "hold": 6, "action": "move"}},
-  {{"move_number": 3, "limb": "left hand", "hold": 6, "action": "match"}}
-]"""
-        }]
-    )
-
-    raw = message.choices[0].message.content.strip()
-    
-    # Clean up in case AI adds markdown
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    
-    import json
-    sequence = json.loads(raw)
-    return sequence
 
 def draw_move_overlay(base_image, holds, sequence, current_step):
     hold_map = {h["number"]: h for h in holds}
     image = base_image.copy()
-    draw = ImageDraw.Draw(image)
+    draw  = ImageDraw.Draw(image)
 
     COLOURS = {
-        "right hand": "#00ff88",
-        "left hand":  "#00ff88",
-        "both hands": "#00ff88",
-        "right foot": "#4488ff",
-        "left foot":  "#4488ff",
-        "both feet":  "#4488ff",
-        "flag right foot": "#ffcc00",
-        "flag left foot":  "#ffcc00",
+        "right hand":       "#00ff88",
+        "left hand":        "#00ff88",
+        "both hands":       "#00ff88",
+        "right foot":       "#4488ff",
+        "left foot":        "#4488ff",
+        "both feet":        "#4488ff",
+        "flag right foot":  "#ffcc00",
+        "flag left foot":   "#ffcc00",
+        "smear right foot": "#ff8800",
+        "smear left foot":  "#ff8800",
+        "swap right foot":  "#cc44ff",
+        "swap left foot":   "#cc44ff",
     }
 
-    # Draw all previous moves as small dim circles
-    for i, move in enumerate(sequence[:current_step]):
+    for move in sequence[:current_step]:
         if move["hold"] is None:
             continue
         hold_num = move["hold"]
@@ -317,19 +586,14 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
         colour = COLOURS.get(move["limb"], "#ffffff")
         draw.ellipse([hx-18, hy-18, hx+18, hy+18], outline=colour, width=2)
 
-    # Draw current move as large bright highlighted circle
     current_move = sequence[current_step]
     if current_move["hold"] is not None:
         hold_num = current_move["hold"]
         if hold_num in hold_map:
             hx, hy = hold_map[hold_num]["x"], hold_map[hold_num]["y"]
             colour = COLOURS.get(current_move["limb"], "#ffffff")
-
-            # Outer glow ring
             draw.ellipse([hx-35, hy-35, hx+35, hy+35], outline=colour, width=2)
-            # Inner filled circle
             draw.ellipse([hx-25, hy-25, hx+25, hy+25], fill=colour)
-            # Move number
             draw.text((hx-8, hy-10), str(current_move["move_number"]), fill="black")
 
     return image
@@ -354,11 +618,11 @@ with col1:
     uploaded_file = st.file_uploader("Upload a climbing wall photo", type=["jpg", "jpeg", "png"])
 
 with col2:
-    colour = st.selectbox("Route colour",
+    colour     = st.selectbox("Route colour",
         ["Black", "Blue", "Red", "Green", "Orange", "Pink", "White", "Yellow", "Purple"])
     difficulty = st.selectbox("Your experience level",
         ["Beginner", "Intermediate", "Advanced"])
-    height_cm = st.number_input("Your height (cm)", min_value=140, max_value=220, value=170)
+    height_cm  = st.number_input("Your height (cm)", min_value=140, max_value=220, value=170)
 
 st.divider()
 st.markdown("#### Wall & Route Details")
@@ -366,7 +630,7 @@ st.markdown("#### Wall & Route Details")
 col3, col4 = st.columns(2)
 
 with col3:
-    wall_angle = st.selectbox("Wall angle",
+    wall_angle  = st.selectbox("Wall angle",
         ["Slab (less than vertical)", "Vertical", "Slight overhang", "Steep overhang", "Roof"])
     start_style = st.selectbox("How is the start marked?",
         ["START label", "Tape on hold", "Two hands on lowest holds", "Not marked"])
@@ -374,7 +638,7 @@ with col3:
 with col4:
     finish_style = st.selectbox("How is the finish marked?",
         ["TOP label", "Tape on hold", "Top-out (both hands on top)", "Not marked"])
-    extra_notes = st.text_area("Any extra notes about this route?",
+    extra_notes  = st.text_area("Any extra notes about this route?",
         placeholder="e.g. 'There is a big move in the middle' or 'The gym is Movement SFU'",
         height=100)
 
@@ -386,18 +650,19 @@ if uploaded_file is not None:
     st.divider()
 
     if st.button("🔍 Detect Holds", use_container_width=True):
-        with st.spinner("Detecting holds..."):
-            annotated_image, holds = detect_holds_by_colour(tmp_path, colour)
+        with st.spinner("Detecting holds and analysing types..."):
+            annotated_image, holds = detect_and_validate_holds(tmp_path, colour)
             st.session_state["annotated_image"] = annotated_image
-            st.session_state["holds"] = holds
-            st.session_state["tmp_path"] = tmp_path
-            st.session_state["start_holds"] = []
-            st.session_state.pop("sequence", None)
-            st.session_state.pop("instructions", None)
-            st.session_state["current_step"] = 0
+            st.session_state["holds"]           = holds
+            st.session_state["tmp_path"]        = tmp_path
+            st.session_state["start_holds"]     = []
+            st.session_state.pop("sequence",      None)
+            st.session_state.pop("instructions",  None)
+            st.session_state.pop("beta_feedback", None)
+            st.session_state["current_step"]    = 0
 
     if "annotated_image" in st.session_state and st.session_state.get("holds"):
-        holds = st.session_state["holds"]
+        holds          = st.session_state["holds"]
         annotated_image = st.session_state["annotated_image"]
 
         st.markdown(f"### 🎯 Detected {len(holds)} {colour} holds")
@@ -423,21 +688,19 @@ if uploaded_file is not None:
 
             if closest_hold and closest_dist < 40:
                 last_click = st.session_state.get("last_click", None)
-                new_click = (value["x"], value["y"])
-        
-            if last_click == new_click:
-                pass  # ignore duplicate clicks
-            else:
-                st.session_state["last_click"] = new_click
-                start_holds = st.session_state.get("start_holds", [])
-                hold_nums = [h["number"] for h in start_holds]
-                if closest_hold["number"] in hold_nums:
-                    start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
-                    st.toast(f"Deselected Hold {closest_hold['number']}")
-                else:
-                    start_holds.append(closest_hold)
-                    st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
-                st.session_state["start_holds"] = start_holds
+                new_click  = (value["x"], value["y"])
+
+                if last_click != new_click:
+                    st.session_state["last_click"] = new_click
+                    start_holds = st.session_state.get("start_holds", [])
+                    hold_nums   = [h["number"] for h in start_holds]
+                    if closest_hold["number"] in hold_nums:
+                        start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
+                        st.toast(f"Deselected Hold {closest_hold['number']}")
+                    else:
+                        start_holds.append(closest_hold)
+                        st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
+                    st.session_state["start_holds"] = start_holds
 
         current_start_holds = st.session_state.get("start_holds", [])
         if current_start_holds:
@@ -448,48 +711,55 @@ if uploaded_file is not None:
 
         st.divider()
 
-        if st.button("📋 Generate Route Instructions", use_container_width=True):
+        if st.button("📋 Generate Suggested Beta", use_container_width=True):
             current_start_holds = st.session_state.get("start_holds", [])
             if not current_start_holds:
                 st.warning("Please click on the start holds in the image before generating instructions.")
             else:
-                with st.spinner("Generating route instructions..."):
-                    image = Image.open(st.session_state["tmp_path"])
-                    image_width, image_height = image.size
+                image = Image.open(st.session_state["tmp_path"])
+                image_width, image_height = image.size
 
-                    graph = build_reachability_graph(
-                        st.session_state["holds"],
-                        image_height,
-                        image_width,
-                        height_cm
-                    )
+                graph = build_reachability_graph(
+                    st.session_state["holds"],
+                    image_height, image_width, height_cm
+                )
 
-                    start_hold_numbers = [h["number"] for h in current_start_holds]
-                    graph_description = format_graph_for_prompt(
-                        graph, st.session_state["holds"], start_hold_numbers
-                    )
+                hold_descriptions = build_holds_description(st.session_state["holds"])
 
-                    instructions = get_route_instructions(
-                        st.session_state["tmp_path"], colour, difficulty, height_cm,
-                        st.session_state["holds"], wall_angle, start_style, finish_style,
-                        extra_notes, current_start_holds, graph_description
-                    )
-                    st.session_state["instructions"] = instructions
+                st.info("Generating sequence — one move at a time...")
+                progress_bar = st.progress(0)
+                status       = st.empty()
 
-                with st.spinner("Building step by step overlay..."):
-                    sequence = get_structured_sequence(instructions, st.session_state["holds"])
-                    st.session_state["sequence"] = sequence
-                    st.session_state["current_step"] = 0
-                    st.session_state["base_image"] = st.session_state["annotated_image"]
+                def on_progress(move_num, max_moves):
+                    progress_bar.progress(move_num / max_moves)
+                    status.caption(f"Generating move {move_num}...")
 
-    # ---- Show instructions and overlay from session state ----
+                sequence = generate_sequence_iteratively(
+                    hold_descriptions,
+                    st.session_state["holds"],
+                    graph,
+                    current_start_holds,
+                    height_cm, difficulty, wall_angle, finish_style, extra_notes,
+                    progress_callback=on_progress
+                )
+
+                progress_bar.empty()
+                status.empty()
+
+                instructions = format_sequence_as_text(sequence, hold_descriptions)
+                st.session_state["instructions"] = instructions
+                st.session_state["sequence"]     = sequence
+                st.session_state["current_step"] = 0
+                st.session_state["base_image"]   = st.session_state["annotated_image"]
+
     if "instructions" in st.session_state:
-        st.markdown("### 📋 Route Breakdown")
+        st.markdown("### 📋 Suggested Beta")
+        st.caption("An AI-generated starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.")
         st.markdown(st.session_state["instructions"])
         st.divider()
 
     if "sequence" in st.session_state and st.session_state["sequence"]:
-        sequence = st.session_state["sequence"]
+        sequence     = st.session_state["sequence"]
         current_step = st.session_state.get("current_step", 0)
 
         st.markdown("### 🎬 Step by Step Overlay")
@@ -505,14 +775,12 @@ if uploaded_file is not None:
         current_move = sequence[current_step]
         limb = current_move["limb"]
         hold = current_move["hold"]
-        action = current_move["action"]
+        cue  = current_move.get("cue", "")
 
-        if hold:
-            st.info(f"**Move {current_step + 1}/{len(sequence)}:** {action.capitalize()} {limb} → Hold {hold}")
-        else:
-            st.info(f"**Move {current_step + 1}/{len(sequence)}:** Flag {limb} against the wall")
+        hold_str = f"Hold {hold}" if hold is not None else "wall"
+        st.info(f"**Move {current_step + 1}/{len(sequence)}:** {limb} → {hold_str} — {cue}")
 
-        st.image(overlay_image, use_column_width=True)
+        st.image(overlay_image, width=700)
 
         col_prev, col_next = st.columns(2)
         with col_prev:
@@ -525,6 +793,35 @@ if uploaded_file is not None:
                 if st.session_state["current_step"] < len(sequence) - 1:
                     st.session_state["current_step"] += 1
                     st.rerun()
+
+    # ---- Rate My Beta ----
+    if "annotated_image" in st.session_state and st.session_state.get("holds"):
+        st.divider()
+        st.markdown("### 🧠 Rate My Beta")
+        st.caption("Already have a sequence in mind? Describe it and get coaching feedback — what works, what to watch out for, and where you might save energy.")
+
+        user_beta = st.text_area(
+            "Describe your beta",
+            placeholder="e.g. Start both hands on hold 5, LF on 2, RF on 1. Step RF up to 3, RH to 6, swap feet on 3...",
+            height=150,
+            key="user_beta_input"
+        )
+
+        if st.button("🧠 Get Feedback on My Beta", use_container_width=True):
+            if not user_beta.strip():
+                st.warning("Describe your sequence first — which hands and feet go where, in order.")
+            else:
+                with st.spinner("Your coach is taking a look..."):
+                    feedback = analyze_user_beta(
+                        st.session_state["annotated_image"],
+                        st.session_state["holds"],
+                        user_beta,
+                        height_cm, difficulty, wall_angle
+                    )
+                    st.session_state["beta_feedback"] = feedback
+
+        if "beta_feedback" in st.session_state:
+            st.markdown(st.session_state["beta_feedback"])
 
 st.divider()
 st.caption("ClimbAI — helping climbers of all levels get through plateaus 🧗")

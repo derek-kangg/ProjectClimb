@@ -1,0 +1,7 @@
+streamlit
+anthropic
+python-dotenv
+opencv-python-headless
+numpy
+Pillow
+streamlit-image-coordinates
