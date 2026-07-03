@@ -680,6 +680,14 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     border-radius: 12px; border: 1px dashed var(--border) !important;
     background: var(--surface) !important;
 }
+/* Hide drag-and-drop instructions — single clean button, mobile friendly */
+[data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
+[data-testid="stFileUploaderDropzone"] { justify-content: center; padding: 0.6rem; }
+[data-testid="stFileUploaderDropzone"] button {
+    font-family: 'Space Grotesk', sans-serif !important;
+    border-radius: 8px; font-weight: 600;
+    width: 100%; padding: 0.55rem 1rem;
+}
 
 /* Alerts */
 .stAlert { border-radius: 10px; }
