@@ -688,7 +688,17 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
 }
 /* Hide drag-and-drop instructions — single clean button, mobile friendly */
 [data-testid="stFileUploaderDropzoneInstructions"] { display: none; }
-[data-testid="stFileUploaderDropzone"] { justify-content: center; padding: 0.6rem; }
+[data-testid="stFileUploaderDropzone"] {
+    justify-content: center; align-items: center; padding: 0.6rem; gap: 0;
+}
+/* The upload icon is a SIBLING of the button inside the dropzone —
+   hide icons anywhere in the dropzone, at any depth */
+[data-testid="stFileUploaderDropzone"] [data-testid="stIconMaterial"],
+[data-testid="stFileUploaderDropzone"] [class*="material-symbols"],
+[data-testid="stFileUploaderDropzone"] svg,
+[data-testid="stFileUploaderDropzone"] i {
+    display: none !important;
+}
 [data-testid="stFileUploaderDropzone"] button {
     font-family: 'Space Grotesk', sans-serif !important;
     border-radius: 8px; font-weight: 600;
@@ -697,16 +707,7 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     text-align: center;
 }
 [data-testid="stFileUploaderDropzone"] button > * { margin: 0 !important; }
-/* Text-only upload button — drop the icon for a cleaner look.
-   Cover all icon variants at any nesting depth, and kill Emotion's
-   built-in margins that push the label off-center. */
 [data-testid="stFileUploaderDropzone"] button * { margin: 0 !important; }
-[data-testid="stFileUploaderDropzone"] button svg,
-[data-testid="stFileUploaderDropzone"] button i,
-[data-testid="stFileUploaderDropzone"] button [data-testid*="Icon"],
-[data-testid="stFileUploaderDropzone"] button [class*="material-symbols"] {
-    display: none !important;
-}
 
 /* Alerts */
 .stAlert { border-radius: 10px; }
