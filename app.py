@@ -707,6 +707,9 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     text-align: center;
 }
 [data-testid="stFileUploaderDropzone"] button > * { margin: 0 !important; }
+/* The button sits inside an auto-width wrapper span — stretch it so the
+   full-width button actually spans the dropzone */
+[data-testid="stFileUploaderDropzone"] > span { display: block; width: 100%; }
 [data-testid="stFileUploaderDropzone"] button * { margin: 0 !important; }
 
 /* Alerts */

@@ -1,7 +1,7 @@
-streamlit
-anthropic
-python-dotenv
-opencv-python-headless
-numpy
-Pillow
-streamlit-image-coordinates
+streamlit==1.55.0
+anthropic==0.84.0
+python-dotenv==1.2.2
+opencv-python-headless==4.10.0.84
+numpy==2.3.5
+Pillow==11.3.0
+streamlit-image-coordinates==0.4.0
