@@ -76,7 +76,7 @@ def detect_and_validate_holds(image_path, colour):
     preview_draw = ImageDraw.Draw(preview)
     for i, c in enumerate(candidates, 1):
         cx, cy = c["x"], c["y"]
-        preview_draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#6fcf4a")
+        preview_draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#fb923c")
         preview_draw.text((cx-5, cy-8), str(i), fill="black")
 
     buf = io.BytesIO()
@@ -171,8 +171,8 @@ Assess every single candidate — do not skip any."""}
             "best_use":  best_use,
         })
 
-        draw.rectangle([bx, by, bx + bw, by + bh], outline="#6fcf4a", width=3)
-        draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#6fcf4a")
+        draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=3)
+        draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#fb923c")
         draw.text((cx-5, cy-8), str(new_number), fill="black")
         new_number += 1
 
@@ -498,7 +498,7 @@ What is the single best next move?"""
 
 
 def format_sequence_as_text(sequence, hold_descriptions):
-    lines = ["### Route Sequence\n"]
+    lines = []
     for move in sequence:
         num      = move["move_number"]
         limb     = move["limb"]
@@ -511,7 +511,7 @@ def format_sequence_as_text(sequence, hold_descriptions):
         else:
             lines.append(f"**Move {num}:** {limb} → {hold_str} — {cue}")
 
-    lines.append("\n---\n### Hold Analysis\n")
+    lines.append("\n**Hold analysis**\n")
     lines.append(hold_descriptions)
     return "\n\n".join(lines)
 
@@ -604,52 +604,166 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
 st.set_page_config(page_title="ClimbAI", page_icon="🧗", layout="centered")
 
 st.markdown("""
-    <h1 style='text-align: center; color: #6fcf4a; font-size: 3rem;'>🧗 ClimbAI</h1>
-    <p style='text-align: center; color: #6b806b; margin-bottom: 2rem;'>
-        Upload a photo of a climbing wall and get an expert route breakdown
-    </p>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=DM+Sans:wght@400;500;600&display=swap');
+
+:root {
+    --bg: #0f1011;
+    --surface: #1a1b1e;
+    --border: #26282c;
+    --text: #ececec;
+    --muted: #9b9ea6;
+    --accent: #fb923c;
+}
+
+html, body, [class*="st-"], .stMarkdown, input, textarea, select {
+    font-family: 'DM Sans', -apple-system, sans-serif !important;
+}
+
+/* Hide Streamlit chrome */
+#MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; height: 0; }
+
+/* Layout */
+.block-container { max-width: 720px; padding-top: 4rem; padding-bottom: 6rem; }
+
+/* Hero */
+.climb-hero { margin-bottom: 3rem; }
+.climb-hero .wordmark {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 3rem; font-weight: 700; letter-spacing: -0.045em;
+    color: var(--text); margin: 0; line-height: 1;
+}
+.climb-hero .wordmark .accent { color: var(--accent); }
+.climb-hero .tagline {
+    color: var(--muted); font-size: 1.02rem; margin-top: 0.9rem;
+    font-weight: 400; max-width: 30rem; line-height: 1.55;
+}
+
+/* Section labels — number, title, keyline */
+.section-label {
+    display: flex; align-items: center; gap: 0.75rem;
+    margin: 3rem 0 0.3rem;
+}
+.section-label .num {
+    font-family: 'Space Grotesk', sans-serif;
+    color: var(--accent); font-size: 0.78rem; font-weight: 600; letter-spacing: 0.1em;
+}
+.section-label .title {
+    font-family: 'Space Grotesk', sans-serif;
+    font-size: 1.12rem; font-weight: 600; color: var(--text); letter-spacing: -0.01em;
+    white-space: nowrap;
+}
+.section-label::after {
+    content: ""; flex: 1; height: 1px; background: var(--border);
+}
+.section-caption { color: var(--muted); font-size: 0.87rem; margin: 0.15rem 0 0.7rem; line-height: 1.5; }
+.accent-text { color: var(--accent); font-weight: 600; }
+
+/* Buttons */
+.stButton > button {
+    font-family: 'Space Grotesk', sans-serif !important;
+    border-radius: 10px; font-weight: 600; padding: 0.7rem 1rem;
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    transition: border-color 0.15s ease, color 0.15s ease, filter 0.15s ease;
+}
+.stButton > button:hover { border-color: var(--accent); color: var(--accent); }
+.stButton > button[kind="primary"] {
+    background: var(--accent); color: var(--bg); border: none;
+}
+.stButton > button[kind="primary"]:hover { filter: brightness(1.1); color: var(--bg); }
+
+/* Inputs */
+.stSelectbox > div > div, .stNumberInput > div > div, .stTextArea textarea {
+    border-radius: 10px !important;
+}
+[data-testid="stFileUploaderDropzone"] {
+    border-radius: 12px; border: 1px dashed var(--border) !important;
+    background: var(--surface) !important;
+}
+
+/* Alerts */
+.stAlert { border-radius: 10px; }
+
+/* Move card */
+.move-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 10px;
+    padding: 0.95rem 1.2rem; margin: 0.4rem 0 1rem;
+}
+.move-card .move-num {
+    font-family: 'Space Grotesk', sans-serif;
+    color: var(--accent); font-weight: 600; font-size: 0.72rem;
+    letter-spacing: 0.12em; text-transform: uppercase;
+}
+.move-card .move-text {
+    font-family: 'Space Grotesk', sans-serif;
+    color: var(--text); font-size: 1.05rem; margin-top: 4px; font-weight: 600;
+}
+.move-card .move-cue { color: var(--muted); font-size: 0.88rem; margin-top: 3px; }
+
+/* Footer */
+.climb-footer {
+    font-family: 'Space Grotesk', sans-serif;
+    color: #55585e; font-size: 0.72rem; text-align: center; margin-top: 5rem;
+    text-transform: uppercase; letter-spacing: 0.18em;
+}
+
+hr { margin: 1.6rem 0 !important; opacity: 0.25; }
+</style>
+
+<div class="climb-hero">
+    <h1 class="wordmark">climb<span class="accent">ai</span></h1>
+    <p class="tagline">Route reading, assisted. Upload a wall photo — get a suggested beta and coaching feedback on your own.</p>
+</div>
 """, unsafe_allow_html=True)
 
-st.divider()
 
-col1, col2 = st.columns([2, 1])
+def section_header(num, title, caption=None):
+    st.markdown(f"""<div class="section-label"><span class="num">{num}</span><span class="title">{title}</span></div>""", unsafe_allow_html=True)
+    if caption:
+        st.markdown(f"""<p class="section-caption">{caption}</p>""", unsafe_allow_html=True)
 
+section_header("01", "The route", "A clear, straight-on photo works best.")
+
+uploaded_file = st.file_uploader("Climbing wall photo", type=["jpg", "jpeg", "png"], label_visibility="collapsed")
+
+col1, col2 = st.columns(2)
 with col1:
-    uploaded_file = st.file_uploader("Upload a climbing wall photo", type=["jpg", "jpeg", "png"])
-
-with col2:
-    colour     = st.selectbox("Route colour",
+    colour = st.selectbox("Route colour",
         ["Black", "Blue", "Red", "Green", "Orange", "Pink", "White", "Yellow", "Purple"])
-    difficulty = st.selectbox("Your experience level",
-        ["Beginner", "Intermediate", "Advanced"])
-    height_cm  = st.number_input("Your height (cm)", min_value=140, max_value=220, value=170)
-
-st.divider()
-st.markdown("#### Wall & Route Details")
+with col2:
+    wall_angle = st.selectbox("Wall angle",
+        ["Slab (less than vertical)", "Vertical", "Slight overhang", "Steep overhang", "Roof"])
 
 col3, col4 = st.columns(2)
-
 with col3:
-    wall_angle  = st.selectbox("Wall angle",
-        ["Slab (less than vertical)", "Vertical", "Slight overhang", "Steep overhang", "Roof"])
-    start_style = st.selectbox("How is the start marked?",
+    start_style = st.selectbox("Start marking",
         ["START label", "Tape on hold", "Two hands on lowest holds", "Not marked"])
-
 with col4:
-    finish_style = st.selectbox("How is the finish marked?",
+    finish_style = st.selectbox("Finish marking",
         ["TOP label", "Tape on hold", "Top-out (both hands on top)", "Not marked"])
-    extra_notes  = st.text_area("Any extra notes about this route?",
-        placeholder="e.g. 'There is a big move in the middle' or 'The gym is Movement SFU'",
-        height=100)
+
+section_header("02", "About you")
+
+col5, col6 = st.columns(2)
+with col5:
+    difficulty = st.selectbox("Experience level",
+        ["Beginner", "Intermediate", "Advanced"])
+with col6:
+    height_cm = st.number_input("Height (cm)", min_value=140, max_value=220, value=170)
+
+extra_notes = st.text_area("Notes (optional)",
+    placeholder="e.g. 'There is a big move in the middle'",
+    height=80)
 
 if uploaded_file is not None:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         tmp.write(uploaded_file.read())
         tmp_path = tmp.name
 
-    st.divider()
+    section_header("03", "Detect holds")
 
-    if st.button("🔍 Detect Holds", use_container_width=True):
+    if st.button("Detect holds", use_container_width=True, type="primary"):
         with st.spinner("Detecting holds and analysing types..."):
             annotated_image, holds = detect_and_validate_holds(tmp_path, colour)
             st.session_state["annotated_image"] = annotated_image
@@ -665,13 +779,7 @@ if uploaded_file is not None:
         holds          = st.session_state["holds"]
         annotated_image = st.session_state["annotated_image"]
 
-        st.markdown(f"### 🎯 Detected {len(holds)} {colour} holds")
-
-        st.markdown("""
-            <p style='color: #6b806b; font-size: 0.85rem;'>
-            👇 Click on the <b>start hold(s)</b> in the image below. Select <b>one hold</b> if both hands start on the same hold, or <b>two holds</b> if each hand starts on a different hold. Click again to deselect.
-            </p>
-        """, unsafe_allow_html=True)
+        st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect.</p>""", unsafe_allow_html=True)
 
         from streamlit_image_coordinates import streamlit_image_coordinates
         value = streamlit_image_coordinates(annotated_image, key="hold_click")
@@ -705,13 +813,13 @@ if uploaded_file is not None:
         current_start_holds = st.session_state.get("start_holds", [])
         if current_start_holds:
             hold_nums = [str(h["number"]) for h in current_start_holds]
-            st.success(f"✅ Start holds selected: Hold {', Hold '.join(hold_nums)}")
+            st.success(f"Start holds: Hold {', Hold '.join(hold_nums)}")
         else:
-            st.info("No start holds selected yet — click the start holds on the image above.")
+            st.info("Click the start hold(s) on the image above.")
 
-        st.divider()
+        section_header("04", "Suggested beta")
 
-        if st.button("📋 Generate Suggested Beta", use_container_width=True):
+        if st.button("Generate suggested beta", use_container_width=True, type="primary"):
             current_start_holds = st.session_state.get("start_holds", [])
             if not current_start_holds:
                 st.warning("Please click on the start holds in the image before generating instructions.")
@@ -726,7 +834,6 @@ if uploaded_file is not None:
 
                 hold_descriptions = build_holds_description(st.session_state["holds"])
 
-                st.info("Generating sequence — one move at a time...")
                 progress_bar = st.progress(0)
                 status       = st.empty()
 
@@ -753,17 +860,14 @@ if uploaded_file is not None:
                 st.session_state["base_image"]   = st.session_state["annotated_image"]
 
     if "instructions" in st.session_state:
-        st.markdown("### 📋 Suggested Beta")
-        st.caption("An AI-generated starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.")
+        st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
         st.markdown(st.session_state["instructions"])
-        st.divider()
 
     if "sequence" in st.session_state and st.session_state["sequence"]:
         sequence     = st.session_state["sequence"]
         current_step = st.session_state.get("current_step", 0)
 
-        st.markdown("### 🎬 Step by Step Overlay")
-        st.caption("Walk through each move on the wall.")
+        section_header("05", "Walk it through", "Step through each move on the wall.")
 
         overlay_image = draw_move_overlay(
             st.session_state["base_image"],
@@ -778,36 +882,41 @@ if uploaded_file is not None:
         cue  = current_move.get("cue", "")
 
         hold_str = f"Hold {hold}" if hold is not None else "wall"
-        st.info(f"**Move {current_step + 1}/{len(sequence)}:** {limb} → {hold_str} — {cue}")
+        st.markdown(f"""
+        <div class="move-card">
+            <div class="move-num">Move {current_step + 1} of {len(sequence)}</div>
+            <div class="move-text">{limb} &rarr; {hold_str}</div>
+            <div class="move-cue">{cue}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
         st.image(overlay_image, width=700)
 
         col_prev, col_next = st.columns(2)
         with col_prev:
-            if st.button("⬅ Previous Move", use_container_width=True):
+            if st.button("Previous", use_container_width=True):
                 if st.session_state["current_step"] > 0:
                     st.session_state["current_step"] -= 1
                     st.rerun()
         with col_next:
-            if st.button("Next Move ➡", use_container_width=True):
+            if st.button("Next", use_container_width=True):
                 if st.session_state["current_step"] < len(sequence) - 1:
                     st.session_state["current_step"] += 1
                     st.rerun()
 
     # ---- Rate My Beta ----
     if "annotated_image" in st.session_state and st.session_state.get("holds"):
-        st.divider()
-        st.markdown("### 🧠 Rate My Beta")
-        st.caption("Already have a sequence in mind? Describe it and get coaching feedback — what works, what to watch out for, and where you might save energy.")
+        section_header("06", "Rate my beta", "Already have a sequence in mind? Describe it and get coaching feedback.")
 
         user_beta = st.text_area(
             "Describe your beta",
             placeholder="e.g. Start both hands on hold 5, LF on 2, RF on 1. Step RF up to 3, RH to 6, swap feet on 3...",
             height=150,
-            key="user_beta_input"
+            key="user_beta_input",
+            label_visibility="collapsed"
         )
 
-        if st.button("🧠 Get Feedback on My Beta", use_container_width=True):
+        if st.button("Get coaching feedback", use_container_width=True, type="primary"):
             if not user_beta.strip():
                 st.warning("Describe your sequence first — which hands and feet go where, in order.")
             else:
@@ -823,5 +932,4 @@ if uploaded_file is not None:
         if "beta_feedback" in st.session_state:
             st.markdown(st.session_state["beta_feedback"])
 
-st.divider()
-st.caption("ClimbAI — helping climbers of all levels get through plateaus 🧗")
+st.markdown("""<p class="climb-footer">climbai &mdash; get through the plateau</p>""", unsafe_allow_html=True)
