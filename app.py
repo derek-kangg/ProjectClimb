@@ -697,8 +697,16 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     text-align: center;
 }
 [data-testid="stFileUploaderDropzone"] button > * { margin: 0 !important; }
-/* Text-only upload button — drop the icon for a cleaner look */
-[data-testid="stFileUploaderDropzone"] button [data-testid="stIconMaterial"] { display: none; }
+/* Text-only upload button — drop the icon for a cleaner look.
+   Cover all icon variants at any nesting depth, and kill Emotion's
+   built-in margins that push the label off-center. */
+[data-testid="stFileUploaderDropzone"] button * { margin: 0 !important; }
+[data-testid="stFileUploaderDropzone"] button svg,
+[data-testid="stFileUploaderDropzone"] button i,
+[data-testid="stFileUploaderDropzone"] button [data-testid*="Icon"],
+[data-testid="stFileUploaderDropzone"] button [class*="material-symbols"] {
+    display: none !important;
+}
 
 /* Alerts */
 .stAlert { border-radius: 10px; }
