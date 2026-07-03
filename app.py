@@ -693,7 +693,10 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     font-family: 'Space Grotesk', sans-serif !important;
     border-radius: 8px; font-weight: 600;
     width: 100%; padding: 0.55rem 1rem;
+    display: flex; align-items: center; justify-content: center; gap: 0;
+    text-align: center;
 }
+[data-testid="stFileUploaderDropzone"] button > * { margin: 0 !important; }
 /* Text-only upload button — drop the icon for a cleaner look */
 [data-testid="stFileUploaderDropzone"] button [data-testid="stIconMaterial"] { display: none; }
 
