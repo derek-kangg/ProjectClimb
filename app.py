@@ -620,6 +620,12 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     font-family: 'DM Sans', -apple-system, sans-serif !important;
 }
 
+/* Restore Streamlit's icon font — icons are ligatures and render as raw words
+   (e.g. "upload") if the font-family override reaches them */
+[data-testid="stIconMaterial"], [class*="material-symbols"] {
+    font-family: 'Material Symbols Rounded' !important;
+}
+
 /* Hide Streamlit chrome */
 #MainMenu, footer, header[data-testid="stHeader"] { visibility: hidden; height: 0; }
 
@@ -688,6 +694,8 @@ html, body, [class*="st-"], .stMarkdown, input, textarea, select {
     border-radius: 8px; font-weight: 600;
     width: 100%; padding: 0.55rem 1rem;
 }
+/* Text-only upload button — drop the icon for a cleaner look */
+[data-testid="stFileUploaderDropzone"] button [data-testid="stIconMaterial"] { display: none; }
 
 /* Alerts */
 .stAlert { border-radius: 10px; }
