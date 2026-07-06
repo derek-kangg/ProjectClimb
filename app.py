@@ -247,7 +247,7 @@ def format_state(state):
 def generate_sequence_iteratively(
     hold_descriptions, holds, graph, start_holds,
     height_cm, difficulty, wall_angle, finish_style, extra_notes,
-    progress_callback=None
+    image_height=None, progress_callback=None
 ):
     """
     Generate a route sequence one move at a time.
@@ -256,6 +256,15 @@ def generate_sequence_iteratively(
     MAX_MOVES = 20
     hold_map = {h["number"]: h for h in holds}
     finish_hold_num = min(holds, key=lambda h: h["y"])["number"]
+
+    # Full body extension (feet to hand) in pixels — same 4m wall-scale
+    # assumption route_graph uses. Guards against endless hand moves with
+    # planted feet, which no human can do.
+    if image_height:
+        pixels_per_cm = image_height / 400.0
+        max_span_px = height_cm * 1.30 * pixels_per_cm
+    else:
+        max_span_px = None
 
     # Auto-place starting feet on the lowest available holds near the start holds.
     # Prefer holds below (higher y) and near the x position of the start hands.
@@ -406,6 +415,7 @@ MECHANICS:
 - Two hands CAN share a hold (match)
 - Two feet CANNOT share a small chip — foot swap instead
 - Only move feet to holds in the foot reachable lists above, or smear/flag on wall
+- As your hands climb, your feet MUST follow — a hand hold beyond full body extension from your feet is unreachable and will be rejected
 
 FOOT ECONOMY — feet are support, hands drive progress:
 - HANDS make upward progress. Move a hand on most moves.
@@ -468,6 +478,21 @@ What is the single best next move?"""
             # Hold must exist
             if hold is not None and hold not in hold_map:
                 return f"Hold {hold} does not exist on this wall. Choose a valid hold number."
+
+            # Over-extension: a hand cannot end up beyond full body extension
+            # from the feet — at some point a foot has to move up
+            if max_span_px and limb in ("right hand", "left hand", "both hands") and hold is not None:
+                foot_holds = [state[f] for f in ("LF", "RF")
+                              if state[f] is not None and state[f] in hold_map]
+                if foot_holds:
+                    hx, hy = hold_map[hold]["x"], hold_map[hold]["y"]
+                    closest_foot = min(
+                        ((hold_map[f]["x"] - hx) ** 2 + (hold_map[f]["y"] - hy) ** 2) ** 0.5
+                        for f in foot_holds
+                    )
+                    if closest_foot > max_span_px:
+                        return (f"Hold {hold} is beyond full body extension from your current feet. "
+                                f"Move a foot up to a higher foothold first, then reach with the hand.")
 
             return None
 
@@ -883,6 +908,7 @@ if uploaded_file is not None:
                     graph,
                     current_start_holds,
                     height_cm, difficulty, wall_angle, finish_style, extra_notes,
+                    image_height=image_height,
                     progress_callback=on_progress
                 )
 
