@@ -1,5 +1,6 @@
 from route_graph import build_reachability_graph, format_graph_for_prompt
 from beta_animation import render_beta_gif
+from climbing_knowledge import technique_library, coaching_knowledge
 from PIL import Image, ImageDraw
 import streamlit as st
 import anthropic
@@ -162,11 +163,12 @@ def detect_and_validate_holds(image_path, colour):
                     "items": {
                         "type": "object",
                         "properties": {
-                            "number":    {"type": "integer"},
-                            "hold_type": {"type": "string", "enum": ["jug", "crimp", "sloper", "pinch", "pocket", "edge", "volume", "chip", "unknown"]},
-                            "best_use":  {"type": "string", "enum": ["handhold", "foothold", "both"]}
+                            "number":      {"type": "integer"},
+                            "hold_type":   {"type": "string", "enum": ["jug", "crimp", "sloper", "pinch", "pocket", "edge", "volume", "chip", "unknown"]},
+                            "best_use":    {"type": "string", "enum": ["handhold", "foothold", "both"]},
+                            "orientation": {"type": "string", "enum": ["top", "undercling", "side-pull left", "side-pull right", "unknown"], "description": "Which direction the usable surface faces: top = pull down on it (normal), undercling = usable surface faces down so palm goes up, side-pull left/right = vertical edge pulled sideways (side of the usable surface)"}
                         },
-                        "required": ["number", "hold_type", "best_use"]
+                        "required": ["number", "hold_type", "best_use", "orientation"]
                     }
                 }
             },
@@ -190,6 +192,7 @@ def detect_and_validate_holds(image_path, colour):
 For every candidate number, identify:
 1. Hold type: jug / crimp / sloper / pinch / pocket / edge / volume / chip
 2. Best use: handhold, foothold, or both (small chips are typically footholds)
+3. Orientation — which way the usable surface faces. This changes how the hold is climbed: top (pull down, normal), undercling (usable surface faces DOWN, palm-up grip), side-pull left or right (vertical edge pulled sideways). Look carefully at the shadows and shape.
 
 Assess every single candidate — do not skip any."""}
             ]
@@ -225,12 +228,13 @@ Assess every single candidate — do not skip any."""}
             size_label = "medium (likely handhold)"
 
         final_holds.append({
-            "number":    new_number,
-            "x":         cx,
-            "y":         cy,
-            "size":      size_label,
-            "hold_type": hold_type,
-            "best_use":  best_use,
+            "number":      new_number,
+            "x":           cx,
+            "y":           cy,
+            "size":        size_label,
+            "hold_type":   hold_type,
+            "best_use":    best_use,
+            "orientation": v.get("orientation", "unknown"),
         })
 
         draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=3)
@@ -254,8 +258,10 @@ def build_holds_description(holds):
         hold_type = h.get("hold_type", "unknown")
         best_use  = h.get("best_use", "both")
         size      = h.get("size", "unknown")
+        orient    = h.get("orientation", "unknown")
+        orient_str = f", orientation={orient}" if orient not in ("unknown", "top") else ""
         lines.append(
-            f"Hold {h['number']}: {hold_type}, {size}, {side} side, best_use={best_use}, x={h['x']}, y={h['y']}"
+            f"Hold {h['number']}: {hold_type}, {size}, {side} side, best_use={best_use}{orient_str}, x={h['x']}, y={h['y']}"
         )
     return "\n".join(lines)
 
@@ -372,6 +378,7 @@ def generate_sequence_iteratively(
 
     hold_positions = "\n".join(
         f"Hold {h['number']}: x={h['x']}, y={h['y']}, size={h['size']}, type={h.get('hold_type','?')}, use={h.get('best_use','both')}"
+        + (f", ORIENTATION={h['orientation']}" if h.get("orientation") not in (None, "unknown", "top") else "")
         for h in sorted(holds, key=lambda x: x["y"], reverse=True)
     )
 
@@ -397,7 +404,7 @@ def generate_sequence_iteratively(
                 },
                 "action": {
                     "type": "string",
-                    "enum": ["move", "match", "flag", "smear", "swap", "heel hook", "toe hook", "drop knee", "deadpoint", "dynamic", "finish"]
+                    "enum": ["move", "match", "flag", "smear", "swap", "heel hook", "toe hook", "drop knee", "knee bar", "backstep", "rockover", "deadpoint", "dyno", "mantle", "finish"]
                 },
                 "cue": {
                     "type": "string",
@@ -407,6 +414,9 @@ def generate_sequence_iteratively(
             "required": ["limb", "hold", "action", "cue"]
         }
     }
+
+    # Expert technique + grip knowledge, scaled to level and wall angle
+    technique_section = technique_library(difficulty, wall_angle)
 
     for move_num in range(1, MAX_MOVES + 1):
         if progress_callback:
@@ -428,27 +438,7 @@ def generate_sequence_iteratively(
             for m in sequence
         )
 
-        if difficulty == "Beginner":
-            technique_section = """TECHNIQUE LIBRARY (low-grade climb — keep it simple and controlled):
-  Footwork: step onto hold | flag for balance | smear on slab | foot swap when needed
-  Hands: match when repositioning is needed
-  Movement: static moves only — no jumping or lunging
-  Avoid heel hooks, toe hooks, drop knees, and dynamic moves unless the hold layout makes them unavoidable."""
-        elif difficulty == "Intermediate":
-            technique_section = """TECHNIQUE LIBRARY (intermediate grade — use technique when it clearly helps):
-  Footwork: step onto hold | backstep (outside edge, hip in) | flag (inside/outside) | heel hook on obvious placements | smear | foot swap
-  Hands: match | side pull | undercling
-  Movement: deadpoint if a hold is just out of static reach
-  Use advanced moves (drop knee, toe hook) only when the geometry clearly calls for it."""
-        else:
-            technique_section = """TECHNIQUE LIBRARY (advanced/high-grade climb — full repertoire expected):
-  Footwork: step | heel hook (heel on/above hold, pull with hamstring) | toe hook (top of foot, pull) | drop knee (rotate knee in, hip drops, extends reach) | backstep (outside edge, hip turned in) | foot swap
-  Balance: inside flag | outside flag | smear
-  Movement: deadpoint (lunge, grip at apex) | dynamic (jump when hold is out of static reach)
-  Hands: match | undercling (palm up, pull toward body) | side pull | gaston (elbow out, push away)
-  Drop knees, heel hooks, and flags are expected — use them proactively for better position."""
-
-        prompt = f"""You are generating a bouldering sequence one move at a time.
+        prompt = f"""You are an experienced climbing coach generating a bouldering sequence one move at a time.
 
 CURRENT BODY STATE:
 {format_state(state)}
@@ -632,14 +622,16 @@ def analyze_user_beta(annotated_image, holds, user_beta, height_cm, difficulty, 
     response = anthropic_client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=1500,
-        system="""You are an experienced bouldering coach reviewing a climber's beta (their planned sequence). Be supportive but honest — like a good coach at the gym.
+        system=f"""You are an experienced bouldering coach reviewing a climber's beta (their planned sequence). Be supportive but honest — like a good coach at the gym.
 
 Your feedback should cover:
 1. WHAT WORKS — parts of their beta that are solid, and why
-2. WATCH OUT FOR — risks or inefficiencies (balance issues, skipped feet, over-gripping)
+2. WATCH OUT FOR — risks or inefficiencies (balance issues, skipped feet, over-gripping, wrong grip for the hold type)
 3. SUGGESTIONS — at most 2-3 concrete improvements, only where they genuinely help. If their beta is good, say so — do not invent problems.
 
-Refer to holds by their numbers. Keep it conversational and under 300 words. Never rewrite their whole sequence — coach the beta they brought you.""",
+Refer to holds by their numbers. Use precise technique vocabulary where it fits (grip choice for the hold type, drop knee vs backstep, deadpoint vs dyno). Keep it conversational and under 300 words. Never rewrite their whole sequence — coach the beta they brought you.
+
+{coaching_knowledge()}""",
         messages=[{
             "role": "user",
             "content": [
