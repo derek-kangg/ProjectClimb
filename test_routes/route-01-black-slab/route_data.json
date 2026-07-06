@@ -1,0 +1,176 @@
+{
+  "colour": "Black",
+  "wall_angle": "Slab (less than vertical)",
+  "difficulty": "Intermediate",
+  "height_cm": 170,
+  "finish_style": "TOP label",
+  "holds": [
+    {
+      "number": 1,
+      "x": 470,
+      "y": 932,
+      "size": "small (likely foothold)",
+      "hold_type": "chip",
+      "best_use": "foothold",
+      "orientation": "top"
+    },
+    {
+      "number": 2,
+      "x": 186,
+      "y": 933,
+      "size": "large (likely handhold)",
+      "hold_type": "edge",
+      "best_use": "both",
+      "orientation": "top"
+    },
+    {
+      "number": 3,
+      "x": 434,
+      "y": 751,
+      "size": "small (likely foothold)",
+      "hold_type": "chip",
+      "best_use": "foothold",
+      "orientation": "top"
+    },
+    {
+      "number": 4,
+      "x": 717,
+      "y": 681,
+      "size": "large (likely handhold)",
+      "hold_type": "sloper",
+      "best_use": "handhold",
+      "orientation": "side-pull left"
+    },
+    {
+      "number": 5,
+      "x": 259,
+      "y": 660,
+      "size": "medium (likely handhold)",
+      "hold_type": "pocket",
+      "best_use": "handhold",
+      "orientation": "top"
+    },
+    {
+      "number": 6,
+      "x": 371,
+      "y": 510,
+      "size": "medium (likely handhold)",
+      "hold_type": "pocket",
+      "best_use": "handhold",
+      "orientation": "top"
+    },
+    {
+      "number": 7,
+      "x": 494,
+      "y": 422,
+      "size": "medium (likely handhold)",
+      "hold_type": "crimp",
+      "best_use": "handhold",
+      "orientation": "top"
+    },
+    {
+      "number": 8,
+      "x": 620,
+      "y": 243,
+      "size": "large (likely handhold)",
+      "hold_type": "sloper",
+      "best_use": "handhold",
+      "orientation": "top"
+    },
+    {
+      "number": 9,
+      "x": 484,
+      "y": 89,
+      "size": "large (likely handhold)",
+      "hold_type": "jug",
+      "best_use": "handhold",
+      "orientation": "top"
+    }
+  ],
+  "start_holds": [
+    {
+      "number": 5,
+      "x": 259,
+      "y": 660,
+      "size": "medium (likely handhold)",
+      "hold_type": "pocket",
+      "best_use": "handhold",
+      "orientation": "top"
+    }
+  ],
+  "verified_beta": {
+    "start_state": {
+      "LH": 5,
+      "RH": 5,
+      "LF": 2,
+      "RF": 1
+    },
+    "moves": [
+      {
+        "limb": "right foot",
+        "hold": 3,
+        "note": "step up to chip"
+      },
+      {
+        "limb": "right hand",
+        "hold": 6,
+        "note": ""
+      },
+      {
+        "limb": "swap left foot",
+        "hold": 3,
+        "note": "LF replaces RF, RF flags"
+      },
+      {
+        "limb": "left hand",
+        "hold": 6,
+        "note": "match"
+      },
+      {
+        "limb": "swap right foot",
+        "hold": 3,
+        "note": "RF replaces LF, LF flags"
+      },
+      {
+        "limb": "right hand",
+        "hold": 7,
+        "note": ""
+      },
+      {
+        "limb": "right foot",
+        "hold": 4,
+        "note": ""
+      },
+      {
+        "limb": "left hand",
+        "hold": 7,
+        "note": "match"
+      },
+      {
+        "limb": "right hand",
+        "hold": 8,
+        "note": ""
+      },
+      {
+        "limb": "left foot",
+        "hold": 7,
+        "note": "or top of volume holding 5/6 \u2014 flexible"
+      },
+      {
+        "limb": "flag right foot",
+        "hold": null,
+        "note": ""
+      },
+      {
+        "limb": "left hand",
+        "hold": 9,
+        "note": ""
+      },
+      {
+        "limb": "right hand",
+        "hold": 9,
+        "note": "match finish"
+      }
+    ]
+  }
+}

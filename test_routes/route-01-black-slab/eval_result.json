@@ -1,0 +1,76 @@
+{
+  "generated_at": "2026-07-06 15:20:30",
+  "elapsed_s": 24.2,
+  "ai_sequence": [
+    {
+      "limb": "left hand",
+      "hold": 6,
+      "action": "move",
+      "cue": "Reach up to pocket, stay tall on slab",
+      "move_number": 1
+    },
+    {
+      "limb": "right hand",
+      "hold": 7,
+      "action": "move",
+      "cue": "Reach right hand to crimp, stay tall",
+      "move_number": 2
+    },
+    {
+      "limb": "right foot",
+      "hold": 3,
+      "action": "move",
+      "cue": "Step up precisely, weight over foot",
+      "move_number": 3
+    },
+    {
+      "limb": "left foot",
+      "hold": 5,
+      "action": "move",
+      "cue": "Step LF up to pocket, weight over foot",
+      "move_number": 4
+    },
+    {
+      "limb": "right hand",
+      "hold": 8,
+      "action": "move",
+      "cue": "Reach tall to sloper, open palm, weight over feet",
+      "move_number": 5
+    },
+    {
+      "limb": "right foot",
+      "hold": 5,
+      "action": "move",
+      "cue": "Step RF up to pocket, weight over foot",
+      "move_number": 6
+    },
+    {
+      "limb": "left foot",
+      "hold": 6,
+      "action": "move",
+      "cue": "Step LF up to pocket, weight over foot",
+      "move_number": 7
+    },
+    {
+      "limb": "right hand",
+      "hold": 9,
+      "action": "finish",
+      "cue": "Open palm on jug, stand tall, finish!",
+      "move_number": 8
+    },
+    {
+      "move_number": 9,
+      "limb": "left hand",
+      "hold": 9,
+      "action": "match",
+      "cue": "Match hands on the finish hold and control it"
+    }
+  ],
+  "scores": {
+    "hand_pair": 0.571,
+    "hand_hold_order": 0.714,
+    "foot_pair": 0.167,
+    "ai_moves": 9,
+    "verified_moves": 13
+  }
+}
