@@ -1,4 +1,5 @@
 from route_graph import build_reachability_graph, format_graph_for_prompt
+from beta_animation import render_beta_gif
 from PIL import Image, ImageDraw
 import streamlit as st
 import anthropic
@@ -282,6 +283,7 @@ def generate_sequence_iteratively(
         start_move = {"move_number": 0, "limb": "both hands", "hold": None, "action": "start", "cue": start_cue}
 
     sequence = [start_move]
+    states = [dict(state)]  # body-state timeline, one entry per sequence step
 
     angle_context = {
         "Slab (less than vertical)": "slab — trust feet, stand tall, smearing common",
@@ -488,13 +490,14 @@ What is the single best next move?"""
 
         state = apply_move_to_state(state, move)
         sequence.append(move)
+        states.append(dict(state))
 
         if move["action"] == "finish":
             break
         if move["hold"] == finish_hold_num and move["limb"] in ("right hand", "left hand", "both hands"):
             break
 
-    return sequence
+    return sequence, states
 
 
 def format_sequence_as_text(sequence, hold_descriptions):
@@ -804,6 +807,8 @@ if uploaded_file is not None:
             st.session_state.pop("sequence",      None)
             st.session_state.pop("instructions",  None)
             st.session_state.pop("beta_feedback", None)
+            st.session_state.pop("states",        None)
+            st.session_state.pop("beta_gif",      None)
             st.session_state["current_step"]    = 0
 
     if "annotated_image" in st.session_state and st.session_state.get("holds"):
@@ -872,7 +877,7 @@ if uploaded_file is not None:
                     progress_bar.progress(move_num / max_moves)
                     status.caption(f"Generating move {move_num}...")
 
-                sequence = generate_sequence_iteratively(
+                sequence, states = generate_sequence_iteratively(
                     hold_descriptions,
                     st.session_state["holds"],
                     graph,
@@ -887,8 +892,10 @@ if uploaded_file is not None:
                 instructions = format_sequence_as_text(sequence, hold_descriptions)
                 st.session_state["instructions"] = instructions
                 st.session_state["sequence"]     = sequence
+                st.session_state["states"]       = states
                 st.session_state["current_step"] = 0
                 st.session_state["base_image"]   = st.session_state["annotated_image"]
+                st.session_state.pop("beta_gif", None)
 
     if "instructions" in st.session_state:
         st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
@@ -934,6 +941,32 @@ if uploaded_file is not None:
                 if st.session_state["current_step"] < len(sequence) - 1:
                     st.session_state["current_step"] += 1
                     st.rerun()
+
+        # ---- Animated demo ----
+        if "states" in st.session_state:
+            st.markdown("""<p class="section-caption" style="margin-top:1.2rem;">Or watch the whole beta as an animation.</p>""", unsafe_allow_html=True)
+
+            if "beta_gif" not in st.session_state:
+                if st.button("🎬 Animate the beta", use_container_width=True):
+                    with st.spinner("Rendering animation..."):
+                        gif_buf = render_beta_gif(
+                            st.session_state["base_image"],
+                            st.session_state["holds"],
+                            sequence,
+                            st.session_state["states"],
+                        )
+                        st.session_state["beta_gif"] = gif_buf.getvalue()
+                    st.rerun()
+
+            if "beta_gif" in st.session_state:
+                st.image(st.session_state["beta_gif"])
+                st.download_button(
+                    "Download GIF",
+                    st.session_state["beta_gif"],
+                    file_name="climbai-beta.gif",
+                    mime="image/gif",
+                    use_container_width=True,
+                )
 
     # ---- Rate My Beta ----
     if "annotated_image" in st.session_state and st.session_state.get("holds"):
