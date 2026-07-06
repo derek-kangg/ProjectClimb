@@ -583,6 +583,22 @@ What is the single best next move?"""
         if move["hold"] == finish_hold_num and move["limb"] in ("right hand", "left hand", "both hands"):
             break
 
+    # A boulder is finished with BOTH hands matched on the finish hold —
+    # if only one hand got there, append the match deterministically.
+    lh_on = state["LH"] == finish_hold_num
+    rh_on = state["RH"] == finish_hold_num
+    if lh_on != rh_on:
+        match_move = {
+            "move_number": sequence[-1]["move_number"] + 1,
+            "limb": "left hand" if rh_on else "right hand",
+            "hold": finish_hold_num,
+            "action": "match",
+            "cue": "Match hands on the finish hold and control it",
+        }
+        state = apply_move_to_state(state, match_move)
+        sequence.append(match_move)
+        states.append(dict(state))
+
     return sequence, states
 
 
@@ -1053,6 +1069,7 @@ if "sequence" in st.session_state and st.session_state["sequence"]:
                     st.session_state["holds"],
                     sequence,
                     st.session_state["states"],
+                    height_cm=height_cm,
                 )
                 st.session_state["beta_gif"] = gif_buf.getvalue()
                 save_route()

@@ -55,9 +55,10 @@ def _mid(pts):
     return (sum(xs) / len(xs), sum(ys) / len(ys))
 
 
-def compute_keypose(state, hold_px, limb_len):
+def compute_keypose(state, hold_px, dims):
     """Concrete pixel positions for all four joints in a given body state.
     Feet that are flagging/smearing (hold None) hang relative to the body."""
+    leg = dims["seg_leg"] * 2
     pts = {}
     for j in JOINTS:
         h = state.get(j)
@@ -68,19 +69,19 @@ def compute_keypose(state, hold_px, limb_len):
     if hands:
         hands_mid = _mid(hands)
     else:  # degenerate, should not happen — park mid-image
-        hands_mid = (limb_len * 4, limb_len * 4)
+        hands_mid = (leg * 2, leg * 2)
 
     feet_known = [pts[j] for j in ("LF", "RF") if j in pts]
     if feet_known:
         feet_mid = _mid(feet_known)
     else:
-        feet_mid = (hands_mid[0], hands_mid[1] + 2.2 * limb_len)
+        feet_mid = (hands_mid[0], hands_mid[1] + dims["torso"] + leg)
 
     hip = _lerp(hands_mid, feet_mid, 0.62)
 
     for j, side in (("LF", -1), ("RF", 1)):
         if j not in pts:
-            pts[j] = (hip[0] + side * 0.9 * limb_len, hip[1] + 0.9 * limb_len)
+            pts[j] = (hip[0] + side * 0.45 * leg, hip[1] + 0.55 * leg)
 
     return pts
 
@@ -115,12 +116,9 @@ def _draw_limb(draw, root, tip, seg_len, prefer_dir, width, colour):
     _draw_line(draw, joint, tip, width, colour)
 
 
-def draw_figure(draw, pts, limb_len, line_w):
+def draw_figure(draw, pts, dims, line_w):
     hands_mid = _mid([pts["LH"], pts["RH"]])
     feet_mid  = _mid([pts["LF"], pts["RF"]])
-
-    shoulder = _lerp(hands_mid, feet_mid, 0.30)
-    hip      = _lerp(hands_mid, feet_mid, 0.62)
 
     # body axis (feet -> hands) and a leftward perpendicular
     ax, ay = hands_mid[0] - feet_mid[0], hands_mid[1] - feet_mid[1]
@@ -130,20 +128,26 @@ def draw_figure(draw, pts, limb_len, line_w):
     if px > 0:  # make perp point screen-left
         px, py = -px, -py
 
-    # real shoulders and hips, not a single point
-    sh_hw, hip_hw = 0.22 * limb_len, 0.14 * limb_len
+    # FIXED-length torso anchored between hands and feet — the body no
+    # longer scales with the span, so big extensions look like a human at
+    # full stretch instead of a growing giant
+    torso = dims["torso"]
+    center = _lerp(hands_mid, feet_mid, 0.46)
+    shoulder = (center[0] + ax * torso / 2, center[1] + ay * torso / 2)
+    hip      = (center[0] - ax * torso / 2, center[1] - ay * torso / 2)
+
+    sh_hw, hip_hw = dims["sh_hw"], dims["hip_hw"]
     shoulder_l = (shoulder[0] + px * sh_hw, shoulder[1] + py * sh_hw)
     shoulder_r = (shoulder[0] - px * sh_hw, shoulder[1] - py * sh_hw)
     hip_l = (hip[0] + px * hip_hw, hip[1] + py * hip_hw)
     hip_r = (hip[0] - px * hip_hw, hip[1] - py * hip_hw)
 
-    head_c = (shoulder[0] + ax * 0.30 * limb_len,
-              shoulder[1] + ay * 0.30 * limb_len)
-    head_r = 0.20 * limb_len
+    head_r = dims["head_r"]
+    head_c = (shoulder[0] + ax * head_r * 1.6,
+              shoulder[1] + ay * head_r * 1.6)
 
-    # fixed bone lengths — arms shorter than legs, like a human
-    seg_arm = 0.80 * limb_len
-    seg_leg = 1.00 * limb_len
+    seg_arm = dims["seg_arm"]
+    seg_leg = dims["seg_leg"]
 
     # torso: shoulder line, hip line, spine
     _draw_line(draw, shoulder_l, shoulder_r, line_w, BODY)
@@ -204,14 +208,26 @@ def _draw_label(draw, text, font, img_w):
     draw.text((10 + pad, 10 + pad), text, fill="#ececec", font=font)
 
 
-def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms=100):
+def render_beta_gif(base_image, holds, sequence, states, height_cm=170,
+                    out_width=480, frame_ms=100):
     """Build the animated GIF. Returns io.BytesIO with the GIF bytes."""
     img = base_image.convert("RGB")
     scale = out_width / img.width
     base = img.resize((out_width, max(1, int(img.height * scale))))
 
     hold_px = {h["number"]: (h["x"] * scale, h["y"] * scale) for h in holds}
-    limb_len = base.height * 0.075
+
+    # Human proportions anchored to the climber's height, using the same
+    # 4m-wall scale assumption as the reachability graph
+    px_cm = base.height / 400.0
+    dims = {
+        "torso":   0.29  * height_cm * px_cm,
+        "seg_arm": 0.21  * height_cm * px_cm,
+        "seg_leg": 0.25  * height_cm * px_cm,
+        "head_r":  0.055 * height_cm * px_cm,
+        "sh_hw":   0.10  * height_cm * px_cm,
+        "hip_hw":  0.065 * height_cm * px_cm,
+    }
     line_w = max(3, out_width // 160)
 
     try:
@@ -221,7 +237,7 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
         font = ImageFont.load_default()
         legend_font = font
 
-    keyposes = [compute_keypose(s, hold_px, limb_len) for s in states]
+    keyposes = [compute_keypose(s, hold_px, dims) for s in states]
 
     # Shared global palette — per-frame palettes are what balloon GIF size.
     # Seed it with the figure colours so they survive quantisation.
@@ -244,7 +260,7 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
             x, y = ring
             draw.ellipse([x - rad, y - rad, x + rad, y + rad],
                          outline=ring_colour, width=3)
-        draw_figure(draw, pts, limb_len, line_w)
+        draw_figure(draw, pts, dims, line_w)
         _draw_label(draw, label, font, out_width)
         _draw_legend(draw, legend_font, out_width)
         frames.append(frame.quantize(palette=palette_img, dither=Image.Dither.NONE))
