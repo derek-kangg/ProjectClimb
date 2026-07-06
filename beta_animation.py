@@ -12,7 +12,25 @@ from PIL import Image, ImageDraw, ImageFont
 
 ACCENT  = "#fb923c"
 OUTLINE = "#0f1011"
+BODY    = "#ececec"
 JOINTS  = ("LH", "RH", "LF", "RF")
+
+LIMB_COLOURS = {
+    "LH": "#facc15",  # left hand  — yellow
+    "RH": "#fb923c",  # right hand — orange
+    "LF": "#4ade80",  # left foot  — green
+    "RF": "#38bdf8",  # right foot — blue
+}
+LIMB_NAMES = {"LH": "L hand", "RH": "R hand", "LF": "L foot", "RF": "R foot"}
+
+
+def _limb_joint(limb):
+    """Map a sequence limb string to its joint key (None for both/unknown)."""
+    if "left" in limb:
+        return "LH" if "hand" in limb else "LF"
+    if "right" in limb:
+        return "RH" if "hand" in limb else "RF"
+    return None
 
 FRAMES_PER_MOVE = 7   # animation frames per move
 HOLD_FRAMES     = 4   # frames the pose is held after each move
@@ -80,15 +98,15 @@ def _bend_point(root, tip, torso_x, amount=0.22):
     return (mx + perp[0] * off, my + perp[1] * off)
 
 
-def _draw_line(draw, a, b, width):
+def _draw_line(draw, a, b, width, colour):
     draw.line([a, b], fill=OUTLINE, width=width + 3)
-    draw.line([a, b], fill=ACCENT, width=width)
+    draw.line([a, b], fill=colour, width=width)
 
 
-def _draw_limb(draw, root, tip, torso_x, width):
+def _draw_limb(draw, root, tip, torso_x, width, colour):
     bend = _bend_point(root, tip, torso_x)
-    _draw_line(draw, root, bend, width)
-    _draw_line(draw, bend, tip, width)
+    _draw_line(draw, root, bend, width, colour)
+    _draw_line(draw, bend, tip, width, colour)
 
 
 def draw_figure(draw, pts, limb_len, line_w):
@@ -105,27 +123,43 @@ def draw_figure(draw, pts, limb_len, line_w):
               shoulder[1] + ay / alen * 0.30 * limb_len)
     head_r = 0.20 * limb_len
 
-    # torso
-    _draw_line(draw, shoulder, hip, line_w + 1)
+    # torso — neutral so the coloured limbs pop
+    _draw_line(draw, shoulder, hip, line_w + 1, BODY)
 
-    # limbs
-    _draw_limb(draw, shoulder, pts["LH"], shoulder[0], line_w)
-    _draw_limb(draw, shoulder, pts["RH"], shoulder[0], line_w)
-    _draw_limb(draw, hip,      pts["LF"], hip[0],      line_w)
-    _draw_limb(draw, hip,      pts["RF"], hip[0],      line_w)
+    # limbs, colour-coded
+    _draw_limb(draw, shoulder, pts["LH"], shoulder[0], line_w, LIMB_COLOURS["LH"])
+    _draw_limb(draw, shoulder, pts["RH"], shoulder[0], line_w, LIMB_COLOURS["RH"])
+    _draw_limb(draw, hip,      pts["LF"], hip[0],      line_w, LIMB_COLOURS["LF"])
+    _draw_limb(draw, hip,      pts["RF"], hip[0],      line_w, LIMB_COLOURS["RF"])
 
     # head
     draw.ellipse([head_c[0] - head_r - 2, head_c[1] - head_r - 2,
                   head_c[0] + head_r + 2, head_c[1] + head_r + 2], fill=OUTLINE)
     draw.ellipse([head_c[0] - head_r, head_c[1] - head_r,
-                  head_c[0] + head_r, head_c[1] + head_r], fill=ACCENT)
+                  head_c[0] + head_r, head_c[1] + head_r], fill=BODY)
 
-    # hands/feet dots
-    r = line_w + 2
+    # hands/feet dots in their limb colour
+    r = line_w + 3
     for j in JOINTS:
         x, y = pts[j]
         draw.ellipse([x - r, y - r, x + r, y + r], fill=OUTLINE)
-        draw.ellipse([x - r + 1, y - r + 1, x + r - 1, y + r - 1], fill="#ffffff")
+        draw.ellipse([x - r + 1, y - r + 1, x + r - 1, y + r - 1],
+                     fill=LIMB_COLOURS[j])
+
+
+def _draw_legend(draw, font, img_w):
+    """Small colour legend, top-right corner."""
+    pad, row_h, sw = 5, 15, 9
+    entries = [(LIMB_COLOURS[j], LIMB_NAMES[j]) for j in JOINTS]
+    w = 74
+    h = pad * 2 + row_h * len(entries)
+    x0 = img_w - w - 8
+    y0 = 8
+    draw.rectangle([x0, y0, x0 + w, y0 + h], fill=OUTLINE)
+    for i, (col, name) in enumerate(entries):
+        y = y0 + pad + i * row_h
+        draw.ellipse([x0 + pad, y + 2, x0 + pad + sw, y + 2 + sw], fill=col)
+        draw.text((x0 + pad + sw + 5, y), name, fill="#ececec", font=font)
 
 
 def _label_for(move):
@@ -158,8 +192,10 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
 
     try:
         font = ImageFont.load_default(size=max(12, out_width // 40))
+        legend_font = ImageFont.load_default(size=11)
     except TypeError:  # older Pillow
         font = ImageFont.load_default()
+        legend_font = font
 
     keyposes = [compute_keypose(s, hold_px, limb_len) for s in states]
 
@@ -168,23 +204,25 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
     pal_src = base.copy()
     seed = ImageDraw.Draw(pal_src)
     # large swatches so median-cut gives these colours their own buckets
-    sw = max(40, out_width // 8)
-    for k, col in enumerate((ACCENT, OUTLINE, "#ffffff", "#ececec")):
+    seed_colours = (ACCENT, OUTLINE, "#ffffff", BODY) + tuple(LIMB_COLOURS.values())
+    sw = max(30, out_width // 10)
+    for k, col in enumerate(seed_colours):
         seed.rectangle([k * sw, 0, (k + 1) * sw - 1, sw - 1], fill=col)
     palette_img = pal_src.quantize(colors=128)
 
     frames = []
 
-    def add_frame(pts, label, ring=None, ring_t=0.0):
+    def add_frame(pts, label, ring=None, ring_t=0.0, ring_colour=ACCENT):
         frame = base.copy()
         draw = ImageDraw.Draw(frame)
         if ring is not None:
             rad = 14 + 8 * math.sin(ring_t * math.pi)
             x, y = ring
             draw.ellipse([x - rad, y - rad, x + rad, y + rad],
-                         outline=ACCENT, width=3)
+                         outline=ring_colour, width=3)
         draw_figure(draw, pts, limb_len, line_w)
         _draw_label(draw, label, font, out_width)
+        _draw_legend(draw, legend_font, out_width)
         frames.append(frame.quantize(palette=palette_img, dither=Image.Dither.NONE))
 
     # intro: start position
@@ -198,8 +236,10 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
         changed = [j for j in JOINTS if _dist(a[j], b[j]) > 2]
         label = _label_for(sequence[i])
 
-        # ring on the destination hold of the primary moving limb
+        # ring on the destination hold, coloured by the moving limb
         ring = None
+        joint = _limb_joint(sequence[i]["limb"])
+        ring_colour = LIMB_COLOURS.get(joint, ACCENT)
         if sequence[i]["hold"] is not None and sequence[i]["hold"] in hold_px:
             ring = hold_px[sequence[i]["hold"]]
 
@@ -219,7 +259,7 @@ def render_beta_gif(base_image, holds, sequence, states, out_width=480, frame_ms
                     pts[j] = (pos[0] + perp[0] * lift, pos[1] + perp[1] * lift)
                 else:
                     pts[j] = a[j]
-            add_frame(pts, label, ring, t)
+            add_frame(pts, label, ring, t, ring_colour)
 
         for _ in range(HOLD_FRAMES):
             add_frame(b, label)

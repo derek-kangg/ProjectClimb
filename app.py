@@ -589,19 +589,21 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
     image = base_image.copy()
     draw  = ImageDraw.Draw(image)
 
+    # One colour per limb, matching the animated figure:
+    # LH yellow, RH orange, LF green, RF blue
     COLOURS = {
-        "right hand":       "#00ff88",
-        "left hand":        "#00ff88",
-        "both hands":       "#00ff88",
-        "right foot":       "#4488ff",
-        "left foot":        "#4488ff",
-        "both feet":        "#4488ff",
-        "flag right foot":  "#ffcc00",
-        "flag left foot":   "#ffcc00",
-        "smear right foot": "#ff8800",
-        "smear left foot":  "#ff8800",
-        "swap right foot":  "#cc44ff",
-        "swap left foot":   "#cc44ff",
+        "right hand":       "#fb923c",
+        "left hand":        "#facc15",
+        "both hands":       "#fb923c",
+        "right foot":       "#38bdf8",
+        "left foot":        "#4ade80",
+        "both feet":        "#38bdf8",
+        "flag right foot":  "#38bdf8",
+        "flag left foot":   "#4ade80",
+        "smear right foot": "#38bdf8",
+        "smear left foot":  "#4ade80",
+        "swap right foot":  "#38bdf8",
+        "swap left foot":   "#4ade80",
     }
 
     for move in sequence[:current_step]:
