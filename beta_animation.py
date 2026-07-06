@@ -85,17 +85,23 @@ def compute_keypose(state, hold_px, limb_len):
     return pts
 
 
-def _bend_point(root, tip, torso_x, amount=0.22):
-    """Elbow/knee: midpoint pushed perpendicular, away from the torso axis."""
+def _solve_joint(root, tip, seg_len, prefer_dir):
+    """Two-bone IK: position of the elbow/knee for a limb with two equal
+    segments of seg_len. Fully extended limbs come out straight; short
+    reaches bend deeply. prefer_dir picks the anatomical bend side."""
+    d = _dist(root, tip)
     mx, my = _mid([root, tip])
-    dx, dy = tip[0] - root[0], tip[1] - root[1]
-    length = math.hypot(dx, dy) or 1.0
-    # both perpendicular candidates; pick the one pointing away from torso
-    p1 = (-dy / length, dx / length)
-    p2 = (dy / length, -dx / length)
-    perp = p1 if (mx + p1[0] - torso_x) * (mx - torso_x + 0.001) >= 0 else p2
-    off = amount * length
-    return (mx + perp[0] * off, my + perp[1] * off)
+
+    if d >= 2 * seg_len or d < 1e-6:
+        return (mx, my)  # straight (or degenerate)
+
+    h = math.sqrt(max(seg_len * seg_len - (d / 2) * (d / 2), 0.0))
+    dx, dy = (tip[0] - root[0]) / d, (tip[1] - root[1]) / d
+    p1 = (-dy, dx)
+    p2 = (dy, -dx)
+    perp = p1 if (p1[0] * prefer_dir[0] + p1[1] * prefer_dir[1]) >= \
+                 (p2[0] * prefer_dir[0] + p2[1] * prefer_dir[1]) else p2
+    return (mx + perp[0] * h, my + perp[1] * h)
 
 
 def _draw_line(draw, a, b, width, colour):
@@ -103,10 +109,10 @@ def _draw_line(draw, a, b, width, colour):
     draw.line([a, b], fill=colour, width=width)
 
 
-def _draw_limb(draw, root, tip, torso_x, width, colour):
-    bend = _bend_point(root, tip, torso_x)
-    _draw_line(draw, root, bend, width, colour)
-    _draw_line(draw, bend, tip, width, colour)
+def _draw_limb(draw, root, tip, seg_len, prefer_dir, width, colour):
+    joint = _solve_joint(root, tip, seg_len, prefer_dir)
+    _draw_line(draw, root, joint, width, colour)
+    _draw_line(draw, joint, tip, width, colour)
 
 
 def draw_figure(draw, pts, limb_len, line_w):
@@ -116,21 +122,39 @@ def draw_figure(draw, pts, limb_len, line_w):
     shoulder = _lerp(hands_mid, feet_mid, 0.30)
     hip      = _lerp(hands_mid, feet_mid, 0.62)
 
-    # head sits above the shoulders along the feet->hands axis
+    # body axis (feet -> hands) and a leftward perpendicular
     ax, ay = hands_mid[0] - feet_mid[0], hands_mid[1] - feet_mid[1]
     alen = math.hypot(ax, ay) or 1.0
-    head_c = (shoulder[0] + ax / alen * 0.30 * limb_len,
-              shoulder[1] + ay / alen * 0.30 * limb_len)
+    ax, ay = ax / alen, ay / alen
+    px, py = -ay, ax
+    if px > 0:  # make perp point screen-left
+        px, py = -px, -py
+
+    # real shoulders and hips, not a single point
+    sh_hw, hip_hw = 0.22 * limb_len, 0.14 * limb_len
+    shoulder_l = (shoulder[0] + px * sh_hw, shoulder[1] + py * sh_hw)
+    shoulder_r = (shoulder[0] - px * sh_hw, shoulder[1] - py * sh_hw)
+    hip_l = (hip[0] + px * hip_hw, hip[1] + py * hip_hw)
+    hip_r = (hip[0] - px * hip_hw, hip[1] - py * hip_hw)
+
+    head_c = (shoulder[0] + ax * 0.30 * limb_len,
+              shoulder[1] + ay * 0.30 * limb_len)
     head_r = 0.20 * limb_len
 
-    # torso — neutral so the coloured limbs pop
+    # fixed bone lengths — arms shorter than legs, like a human
+    seg_arm = 0.80 * limb_len
+    seg_leg = 1.00 * limb_len
+
+    # torso: shoulder line, hip line, spine
+    _draw_line(draw, shoulder_l, shoulder_r, line_w, BODY)
+    _draw_line(draw, hip_l, hip_r, line_w, BODY)
     _draw_line(draw, shoulder, hip, line_w + 1, BODY)
 
-    # limbs, colour-coded
-    _draw_limb(draw, shoulder, pts["LH"], shoulder[0], line_w, LIMB_COLOURS["LH"])
-    _draw_limb(draw, shoulder, pts["RH"], shoulder[0], line_w, LIMB_COLOURS["RH"])
-    _draw_limb(draw, hip,      pts["LF"], hip[0],      line_w, LIMB_COLOURS["LF"])
-    _draw_limb(draw, hip,      pts["RF"], hip[0],      line_w, LIMB_COLOURS["RF"])
+    # limbs — elbows bend out-and-down, knees frog out-and-slightly-up
+    _draw_limb(draw, shoulder_l, pts["LH"], seg_arm, (-1.0,  0.5), line_w, LIMB_COLOURS["LH"])
+    _draw_limb(draw, shoulder_r, pts["RH"], seg_arm, ( 1.0,  0.5), line_w, LIMB_COLOURS["RH"])
+    _draw_limb(draw, hip_l,      pts["LF"], seg_leg, (-1.0, -0.25), line_w, LIMB_COLOURS["LF"])
+    _draw_limb(draw, hip_r,      pts["RF"], seg_leg, ( 1.0, -0.25), line_w, LIMB_COLOURS["RF"])
 
     # head
     draw.ellipse([head_c[0] - head_r - 2, head_c[1] - head_r - 2,
