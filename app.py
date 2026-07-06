@@ -13,6 +13,7 @@ import tempfile
 import io
 import json
 import shutil
+import re
 
 load_dotenv()
 
@@ -27,13 +28,21 @@ def get_api_key():
 
 anthropic_client = anthropic.Anthropic(api_key=get_api_key())
 
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_routes", "last")
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+ROUTES_ROOT      = os.path.join(_APP_DIR, "saved_routes")
+TEST_ROUTES_ROOT = os.path.join(_APP_DIR, "test_routes")
+SAVE_DIR         = os.path.join(ROUTES_ROOT, "last")
 
 
-def save_route():
+def _slugify(name):
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+def save_route(target_dir=None):
     """Persist the current route so it can be resumed later without
     re-running hold detection or beta generation (no API cost)."""
-    os.makedirs(SAVE_DIR, exist_ok=True)
+    target = target_dir or SAVE_DIR
+    os.makedirs(target, exist_ok=True)
     ss = st.session_state
     data = {
         "holds":        ss.get("holds"),
@@ -42,29 +51,38 @@ def save_route():
         "states":       ss.get("states"),
         "instructions": ss.get("instructions"),
     }
-    with open(os.path.join(SAVE_DIR, "route.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(target, "route.json"), "w", encoding="utf-8") as f:
         json.dump(data, f)
     if ss.get("annotated_image") is not None:
-        ss["annotated_image"].save(os.path.join(SAVE_DIR, "annotated.png"))
+        ss["annotated_image"].save(os.path.join(target, "annotated.png"))
     tmp = ss.get("tmp_path")
-    original = os.path.join(SAVE_DIR, "original.jpg")
+    original = os.path.join(target, "original.jpg")
     if tmp and os.path.exists(tmp) and os.path.abspath(tmp) != os.path.abspath(original):
         shutil.copyfile(tmp, original)
     if ss.get("beta_gif"):
-        with open(os.path.join(SAVE_DIR, "beta.gif"), "wb") as f:
+        with open(os.path.join(target, "beta.gif"), "wb") as f:
             f.write(ss["beta_gif"])
 
 
-def saved_route_exists():
-    return os.path.exists(os.path.join(SAVE_DIR, "route.json"))
+def list_saved_routes():
+    """Names of all saved routes, 'last' (autosave) first."""
+    if not os.path.isdir(ROUTES_ROOT):
+        return []
+    names = [n for n in sorted(os.listdir(ROUTES_ROOT))
+             if os.path.exists(os.path.join(ROUTES_ROOT, n, "route.json"))]
+    if "last" in names:
+        names.remove("last")
+        names.insert(0, "last")
+    return names
 
 
-def load_route():
+def load_route(source_dir=None):
     """Restore a saved route into session state. Returns True on success."""
+    source = source_dir or SAVE_DIR
     try:
-        with open(os.path.join(SAVE_DIR, "route.json"), "r", encoding="utf-8") as f:
+        with open(os.path.join(source, "route.json"), "r", encoding="utf-8") as f:
             data = json.load(f)
-        annotated = Image.open(os.path.join(SAVE_DIR, "annotated.png")).convert("RGB")
+        annotated = Image.open(os.path.join(source, "annotated.png")).convert("RGB")
     except Exception:
         return False
     ss = st.session_state
@@ -72,19 +90,87 @@ def load_route():
     ss["start_holds"]     = data.get("start_holds") or []
     ss["annotated_image"] = annotated
     ss["base_image"]      = annotated
-    ss["tmp_path"]        = os.path.join(SAVE_DIR, "original.jpg")
+    ss["tmp_path"]        = os.path.join(source, "original.jpg")
     ss["current_step"]    = 0
+    ss.pop("sequence", None)
+    ss.pop("states", None)
+    ss.pop("instructions", None)
+    ss.pop("beta_gif", None)
     if data.get("sequence"):
         ss["sequence"] = data["sequence"]
     if data.get("states"):
         ss["states"] = data["states"]
     if data.get("instructions"):
         ss["instructions"] = data["instructions"]
-    gif_path = os.path.join(SAVE_DIR, "beta.gif")
+    gif_path = os.path.join(source, "beta.gif")
     if os.path.exists(gif_path):
         with open(gif_path, "rb") as f:
             ss["beta_gif"] = f.read()
     return True
+
+
+def export_test_route(slug, colour, wall_angle, difficulty):
+    """Write the current route into test_routes/<slug>/ in the evaluation
+    format: wall photo, machine-readable data, and a route.md with the AI
+    beta prefilled and a section for the climber's verified beta."""
+    target = os.path.join(TEST_ROUTES_ROOT, slug)
+    os.makedirs(target, exist_ok=True)
+    ss = st.session_state
+
+    tmp = ss.get("tmp_path")
+    if tmp and os.path.exists(tmp):
+        shutil.copyfile(tmp, os.path.join(target, "wall.jpg"))
+
+    holds = ss.get("holds") or []
+    seq   = ss.get("sequence") or []
+
+    hold_lines = "\n".join(
+        f"- Hold {h['number']}: {h.get('hold_type', '?')}, {h.get('size', '?')}"
+        + (f", {h['orientation']}" if h.get("orientation") not in (None, "unknown", "top") else "")
+        + f", x={h['x']}, y={h['y']}"
+        for h in holds
+    )
+    ai_lines = "\n".join(
+        f"{m['move_number']}. {m['limb']} -> "
+        + (f"hold {m['hold']}" if m["hold"] is not None else "wall")
+        + f" ({m['action']}) - {m.get('cue', '')}"
+        for m in seq
+    )
+
+    md = f"""# {slug}
+
+- Gym / wall:
+- Colour: {colour}
+- Grade:
+- Wall angle: {wall_angle}
+- Level used in app: {difficulty}
+- Start:
+- Finish:
+
+## Detected holds
+
+{hold_lines}
+
+## AI suggested beta (for reference)
+
+{ai_lines}
+
+## My verified beta (fill this in after climbing)
+
+START:
+1.
+
+## Notes
+
+"""
+    with open(os.path.join(target, "route.md"), "w", encoding="utf-8") as f:
+        f.write(md)
+    with open(os.path.join(target, "route_data.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "holds": holds, "ai_sequence": seq, "colour": colour,
+            "wall_angle": wall_angle, "difficulty": difficulty,
+        }, f, indent=2)
+    return os.path.relpath(target, _APP_DIR)
 
 COLOUR_RANGES = {
     "Black":  [(0, 0, 0),      (180, 80, 50)],
@@ -908,14 +994,18 @@ if uploaded_file is not None:
             st.session_state["current_step"]    = 0
             save_route()
 
-elif "holds" not in st.session_state and saved_route_exists():
+elif "holds" not in st.session_state and list_saved_routes():
     section_header("03", "Detect holds")
-    st.markdown("""<p class="section-caption">No photo uploaded — but your last route is saved. Pick up where you left off, no re-detection or regeneration needed.</p>""", unsafe_allow_html=True)
-    if st.button("Resume last route", use_container_width=True, type="primary"):
-        if load_route():
-            st.rerun()
-        else:
-            st.warning("Couldn't load the saved route — upload a photo instead.")
+    st.markdown("""<p class="section-caption">No photo uploaded — load a route from your library instead. No re-detection or regeneration needed.</p>""", unsafe_allow_html=True)
+    col_pick, col_load = st.columns([2, 1])
+    with col_pick:
+        chosen_route = st.selectbox("Saved routes", list_saved_routes(), label_visibility="collapsed")
+    with col_load:
+        if st.button("Load route", use_container_width=True, type="primary"):
+            if load_route(os.path.join(ROUTES_ROOT, chosen_route)):
+                st.rerun()
+            else:
+                st.warning("Couldn't load that route — upload a photo instead.")
 
 if "annotated_image" in st.session_state and st.session_state.get("holds"):
     holds           = st.session_state["holds"]
@@ -1114,5 +1204,34 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
 
     if "beta_feedback" in st.session_state:
         st.markdown(st.session_state["beta_feedback"])
+
+# ---- Save & export ----
+if "sequence" in st.session_state and st.session_state.get("holds"):
+    section_header("07", "Save this route", "Keep it in your library, or export it as a test case for improving the AI.")
+
+    route_name = st.text_input(
+        "Route name",
+        placeholder="e.g. movement-blue-v2",
+        key="route_name",
+        label_visibility="collapsed"
+    )
+
+    col_save, col_export = st.columns(2)
+    with col_save:
+        if st.button("Save to library", use_container_width=True):
+            slug = _slugify(route_name)
+            if not slug:
+                st.warning("Give the route a name first.")
+            else:
+                save_route(os.path.join(ROUTES_ROOT, slug))
+                st.success(f"Saved to library as '{slug}' — load it any time from the start screen.")
+    with col_export:
+        if st.button("Export as test route", use_container_width=True):
+            slug = _slugify(route_name)
+            if not slug:
+                st.warning("Give the route a name first.")
+            else:
+                path = export_test_route(slug, colour, wall_angle, difficulty)
+                st.success(f"Exported to {path} — open route.md and fill in your verified beta after climbing it.")
 
 st.markdown("""<p class="climb-footer">climbai &mdash; get through the plateau</p>""", unsafe_allow_html=True)
