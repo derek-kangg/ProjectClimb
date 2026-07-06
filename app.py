@@ -634,19 +634,22 @@ if uploaded_file is not None:
     section_header("03", "Detect holds")
 
     if st.button("Detect holds", use_container_width=True, type="primary"):
-        with st.spinner("Detecting holds and analysing types..."):
-            annotated_image, holds = detect_and_validate_holds(tmp_path, colour)
-            st.session_state["annotated_image"] = annotated_image
-            st.session_state["holds"]           = holds
-            st.session_state["tmp_path"]        = tmp_path
-            st.session_state["start_holds"]     = []
-            st.session_state.pop("sequence",      None)
-            st.session_state.pop("instructions",  None)
-            st.session_state.pop("beta_feedback", None)
-            st.session_state.pop("states",        None)
-            st.session_state.pop("beta_gif",      None)
-            st.session_state["current_step"]    = 0
-            save_route()
+        try:
+            with st.spinner("Detecting holds and analysing types..."):
+                annotated_image, holds = detect_and_validate_holds(tmp_path, colour)
+                st.session_state["annotated_image"] = annotated_image
+                st.session_state["holds"]           = holds
+                st.session_state["tmp_path"]        = tmp_path
+                st.session_state["start_holds"]     = []
+                st.session_state.pop("sequence",      None)
+                st.session_state.pop("instructions",  None)
+                st.session_state.pop("beta_feedback", None)
+                st.session_state.pop("states",        None)
+                st.session_state.pop("beta_gif",      None)
+                st.session_state["current_step"]    = 0
+                save_route()
+        except Exception:
+            st.error("Hold detection hit a snag — likely a network hiccup. Give it another go.")
 
 elif "holds" not in st.session_state and list_saved_routes():
     section_header("03", "Detect holds")
@@ -668,10 +671,20 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
     st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect.</p>""", unsafe_allow_html=True)
 
     from streamlit_image_coordinates import streamlit_image_coordinates
-    value = streamlit_image_coordinates(annotated_image, key="hold_click")
+    value = streamlit_image_coordinates(annotated_image, key="hold_click", use_column_width="always")
 
     if value is not None and "sequence" not in st.session_state:
-        click_x, click_y = value["x"], value["y"]
+        # The component reports clicks in DISPLAYED pixels (plus the displayed
+        # size) — rescale into original image space or taps on phones, where
+        # the image is shrunk to fit, would land on the wrong holds.
+        disp_w = value.get("width") or annotated_image.width
+        disp_h = value.get("height") or annotated_image.height
+        click_x = value["x"] * annotated_image.width / disp_w
+        click_y = value["y"] * annotated_image.height / disp_h
+
+        # Match threshold scales with image size (fat-finger friendly)
+        threshold = max(40, annotated_image.width * 0.06)
+
         closest_hold = None
         closest_dist = float("inf")
         for h in holds:
@@ -680,7 +693,7 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 closest_dist = dist
                 closest_hold = h
 
-        if closest_hold and closest_dist < 40:
+        if closest_hold and closest_dist < threshold:
             last_click = st.session_state.get("last_click", None)
             new_click  = (value["x"], value["y"])
 
@@ -727,28 +740,33 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 progress_bar.progress(move_num / max_moves)
                 status.caption(f"Generating move {move_num}...")
 
-            sequence, states = generate_sequence_iteratively(
-                anthropic_client,
-                hold_descriptions,
-                st.session_state["holds"],
-                graph,
-                current_start_holds,
-                height_cm, difficulty, wall_angle, finish_style, extra_notes,
-                image_height=image_height,
-                progress_callback=on_progress
-            )
+            try:
+                sequence, states = generate_sequence_iteratively(
+                    anthropic_client,
+                    hold_descriptions,
+                    st.session_state["holds"],
+                    graph,
+                    current_start_holds,
+                    height_cm, difficulty, wall_angle, finish_style, extra_notes,
+                    image_height=image_height,
+                    progress_callback=on_progress
+                )
+            except Exception:
+                progress_bar.empty()
+                status.empty()
+                st.error("Beta generation was interrupted — likely a network hiccup. Your holds are still here; just hit generate again.")
+            else:
+                progress_bar.empty()
+                status.empty()
 
-            progress_bar.empty()
-            status.empty()
-
-            instructions = format_sequence_as_text(sequence, hold_descriptions)
-            st.session_state["instructions"] = instructions
-            st.session_state["sequence"]     = sequence
-            st.session_state["states"]       = states
-            st.session_state["current_step"] = 0
-            st.session_state["base_image"]   = st.session_state["annotated_image"]
-            st.session_state.pop("beta_gif", None)
-            save_route()
+                instructions = format_sequence_as_text(sequence, hold_descriptions)
+                st.session_state["instructions"] = instructions
+                st.session_state["sequence"]     = sequence
+                st.session_state["states"]       = states
+                st.session_state["current_step"] = 0
+                st.session_state["base_image"]   = st.session_state["annotated_image"]
+                st.session_state.pop("beta_gif", None)
+                save_route()
 
 if "instructions" in st.session_state:
     st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
@@ -848,14 +866,17 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
         if not user_beta.strip():
             st.warning("Describe your sequence first — which hands and feet go where, in order.")
         else:
-            with st.spinner("Your coach is taking a look..."):
-                feedback = analyze_user_beta(
-                    st.session_state["annotated_image"],
-                    st.session_state["holds"],
-                    user_beta,
-                    height_cm, difficulty, wall_angle
-                )
-                st.session_state["beta_feedback"] = feedback
+            try:
+                with st.spinner("Your coach is taking a look..."):
+                    feedback = analyze_user_beta(
+                        st.session_state["annotated_image"],
+                        st.session_state["holds"],
+                        user_beta,
+                        height_cm, difficulty, wall_angle
+                    )
+                    st.session_state["beta_feedback"] = feedback
+            except Exception:
+                st.error("The coach lost connection — try again in a moment.")
 
     if "beta_feedback" in st.session_state:
         st.markdown(st.session_state["beta_feedback"])
