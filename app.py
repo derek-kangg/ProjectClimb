@@ -10,6 +10,8 @@ import os
 import base64
 import tempfile
 import io
+import json
+import shutil
 
 load_dotenv()
 
@@ -23,6 +25,65 @@ def get_api_key():
     return key
 
 anthropic_client = anthropic.Anthropic(api_key=get_api_key())
+
+SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_routes", "last")
+
+
+def save_route():
+    """Persist the current route so it can be resumed later without
+    re-running hold detection or beta generation (no API cost)."""
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    ss = st.session_state
+    data = {
+        "holds":        ss.get("holds"),
+        "start_holds":  ss.get("start_holds", []),
+        "sequence":     ss.get("sequence"),
+        "states":       ss.get("states"),
+        "instructions": ss.get("instructions"),
+    }
+    with open(os.path.join(SAVE_DIR, "route.json"), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    if ss.get("annotated_image") is not None:
+        ss["annotated_image"].save(os.path.join(SAVE_DIR, "annotated.png"))
+    tmp = ss.get("tmp_path")
+    original = os.path.join(SAVE_DIR, "original.jpg")
+    if tmp and os.path.exists(tmp) and os.path.abspath(tmp) != os.path.abspath(original):
+        shutil.copyfile(tmp, original)
+    if ss.get("beta_gif"):
+        with open(os.path.join(SAVE_DIR, "beta.gif"), "wb") as f:
+            f.write(ss["beta_gif"])
+
+
+def saved_route_exists():
+    return os.path.exists(os.path.join(SAVE_DIR, "route.json"))
+
+
+def load_route():
+    """Restore a saved route into session state. Returns True on success."""
+    try:
+        with open(os.path.join(SAVE_DIR, "route.json"), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        annotated = Image.open(os.path.join(SAVE_DIR, "annotated.png")).convert("RGB")
+    except Exception:
+        return False
+    ss = st.session_state
+    ss["holds"]           = data.get("holds") or []
+    ss["start_holds"]     = data.get("start_holds") or []
+    ss["annotated_image"] = annotated
+    ss["base_image"]      = annotated
+    ss["tmp_path"]        = os.path.join(SAVE_DIR, "original.jpg")
+    ss["current_step"]    = 0
+    if data.get("sequence"):
+        ss["sequence"] = data["sequence"]
+    if data.get("states"):
+        ss["states"] = data["states"]
+    if data.get("instructions"):
+        ss["instructions"] = data["instructions"]
+    gif_path = os.path.join(SAVE_DIR, "beta.gif")
+    if os.path.exists(gif_path):
+        with open(gif_path, "rb") as f:
+            ss["beta_gif"] = f.read()
+    return True
 
 COLOUR_RANGES = {
     "Black":  [(0, 0, 0),      (180, 80, 50)],
@@ -837,157 +898,178 @@ if uploaded_file is not None:
             st.session_state.pop("states",        None)
             st.session_state.pop("beta_gif",      None)
             st.session_state["current_step"]    = 0
+            save_route()
 
-    if "annotated_image" in st.session_state and st.session_state.get("holds"):
-        holds          = st.session_state["holds"]
-        annotated_image = st.session_state["annotated_image"]
-
-        st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect.</p>""", unsafe_allow_html=True)
-
-        from streamlit_image_coordinates import streamlit_image_coordinates
-        value = streamlit_image_coordinates(annotated_image, key="hold_click")
-
-        if value is not None and "sequence" not in st.session_state:
-            click_x, click_y = value["x"], value["y"]
-            closest_hold = None
-            closest_dist = float("inf")
-            for h in holds:
-                dist = ((h["x"] - click_x) ** 2 + (h["y"] - click_y) ** 2) ** 0.5
-                if dist < closest_dist:
-                    closest_dist = dist
-                    closest_hold = h
-
-            if closest_hold and closest_dist < 40:
-                last_click = st.session_state.get("last_click", None)
-                new_click  = (value["x"], value["y"])
-
-                if last_click != new_click:
-                    st.session_state["last_click"] = new_click
-                    start_holds = st.session_state.get("start_holds", [])
-                    hold_nums   = [h["number"] for h in start_holds]
-                    if closest_hold["number"] in hold_nums:
-                        start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
-                        st.toast(f"Deselected Hold {closest_hold['number']}")
-                    else:
-                        start_holds.append(closest_hold)
-                        st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
-                    st.session_state["start_holds"] = start_holds
-
-        current_start_holds = st.session_state.get("start_holds", [])
-        if current_start_holds:
-            hold_nums = [str(h["number"]) for h in current_start_holds]
-            st.success(f"Start holds: Hold {', Hold '.join(hold_nums)}")
+elif "holds" not in st.session_state and saved_route_exists():
+    section_header("03", "Detect holds")
+    st.markdown("""<p class="section-caption">No photo uploaded — but your last route is saved. Pick up where you left off, no re-detection or regeneration needed.</p>""", unsafe_allow_html=True)
+    if st.button("Resume last route", use_container_width=True, type="primary"):
+        if load_route():
+            st.rerun()
         else:
-            st.info("Click the start hold(s) on the image above.")
+            st.warning("Couldn't load the saved route — upload a photo instead.")
 
-        section_header("04", "Suggested beta")
+if "annotated_image" in st.session_state and st.session_state.get("holds"):
+    holds           = st.session_state["holds"]
+    annotated_image = st.session_state["annotated_image"]
 
-        if st.button("Generate suggested beta", use_container_width=True, type="primary"):
-            current_start_holds = st.session_state.get("start_holds", [])
-            if not current_start_holds:
-                st.warning("Please click on the start holds in the image before generating instructions.")
-            else:
-                image = Image.open(st.session_state["tmp_path"])
-                image_width, image_height = image.size
+    st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect.</p>""", unsafe_allow_html=True)
 
-                graph = build_reachability_graph(
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    value = streamlit_image_coordinates(annotated_image, key="hold_click")
+
+    if value is not None and "sequence" not in st.session_state:
+        click_x, click_y = value["x"], value["y"]
+        closest_hold = None
+        closest_dist = float("inf")
+        for h in holds:
+            dist = ((h["x"] - click_x) ** 2 + (h["y"] - click_y) ** 2) ** 0.5
+            if dist < closest_dist:
+                closest_dist = dist
+                closest_hold = h
+
+        if closest_hold and closest_dist < 40:
+            last_click = st.session_state.get("last_click", None)
+            new_click  = (value["x"], value["y"])
+
+            if last_click != new_click:
+                st.session_state["last_click"] = new_click
+                start_holds = st.session_state.get("start_holds", [])
+                hold_nums   = [h["number"] for h in start_holds]
+                if closest_hold["number"] in hold_nums:
+                    start_holds = [h for h in start_holds if h["number"] != closest_hold["number"]]
+                    st.toast(f"Deselected Hold {closest_hold['number']}")
+                else:
+                    start_holds.append(closest_hold)
+                    st.toast(f"Selected Hold {closest_hold['number']} as start hold!")
+                st.session_state["start_holds"] = start_holds
+
+    current_start_holds = st.session_state.get("start_holds", [])
+    if current_start_holds:
+        hold_nums = [str(h["number"]) for h in current_start_holds]
+        st.success(f"Start holds: Hold {', Hold '.join(hold_nums)}")
+    else:
+        st.info("Click the start hold(s) on the image above.")
+
+    section_header("04", "Suggested beta")
+
+    if st.button("Generate suggested beta", use_container_width=True, type="primary"):
+        current_start_holds = st.session_state.get("start_holds", [])
+        if not current_start_holds:
+            st.warning("Please click on the start holds in the image before generating instructions.")
+        else:
+            image = Image.open(st.session_state["tmp_path"])
+            image_width, image_height = image.size
+
+            graph = build_reachability_graph(
+                st.session_state["holds"],
+                image_height, image_width, height_cm
+            )
+
+            hold_descriptions = build_holds_description(st.session_state["holds"])
+
+            progress_bar = st.progress(0)
+            status       = st.empty()
+
+            def on_progress(move_num, max_moves):
+                progress_bar.progress(move_num / max_moves)
+                status.caption(f"Generating move {move_num}...")
+
+            sequence, states = generate_sequence_iteratively(
+                hold_descriptions,
+                st.session_state["holds"],
+                graph,
+                current_start_holds,
+                height_cm, difficulty, wall_angle, finish_style, extra_notes,
+                image_height=image_height,
+                progress_callback=on_progress
+            )
+
+            progress_bar.empty()
+            status.empty()
+
+            instructions = format_sequence_as_text(sequence, hold_descriptions)
+            st.session_state["instructions"] = instructions
+            st.session_state["sequence"]     = sequence
+            st.session_state["states"]       = states
+            st.session_state["current_step"] = 0
+            st.session_state["base_image"]   = st.session_state["annotated_image"]
+            st.session_state.pop("beta_gif", None)
+            save_route()
+
+if "instructions" in st.session_state:
+    st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
+    st.markdown(st.session_state["instructions"])
+
+if "sequence" in st.session_state and st.session_state["sequence"]:
+    sequence     = st.session_state["sequence"]
+    current_step = st.session_state.get("current_step", 0)
+
+    section_header("05", "Walk it through", "Step through each move on the wall.")
+
+    overlay_image = draw_move_overlay(
+        st.session_state["base_image"],
+        st.session_state["holds"],
+        sequence,
+        current_step
+    )
+
+    current_move = sequence[current_step]
+    limb = current_move["limb"]
+    hold = current_move["hold"]
+    cue  = current_move.get("cue", "")
+
+    hold_str = f"Hold {hold}" if hold is not None else "wall"
+    st.markdown(f"""
+    <div class="move-card">
+        <div class="move-num">Move {current_step + 1} of {len(sequence)}</div>
+        <div class="move-text">{limb} &rarr; {hold_str}</div>
+        <div class="move-cue">{cue}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.image(overlay_image, width=700)
+
+    col_prev, col_next = st.columns(2)
+    with col_prev:
+        if st.button("Previous", use_container_width=True):
+            if st.session_state["current_step"] > 0:
+                st.session_state["current_step"] -= 1
+                st.rerun()
+    with col_next:
+        if st.button("Next", use_container_width=True):
+            if st.session_state["current_step"] < len(sequence) - 1:
+                st.session_state["current_step"] += 1
+                st.rerun()
+
+    # ---- Animated demo ----
+    if "states" in st.session_state:
+        st.markdown("""<p class="section-caption" style="margin-top:1.2rem;">Or watch the whole beta as an animation.</p>""", unsafe_allow_html=True)
+
+        def _render_and_store_gif():
+            with st.spinner("Rendering animation..."):
+                gif_buf = render_beta_gif(
+                    st.session_state["base_image"],
                     st.session_state["holds"],
-                    image_height, image_width, height_cm
+                    sequence,
+                    st.session_state["states"],
                 )
+                st.session_state["beta_gif"] = gif_buf.getvalue()
+                save_route()
 
-                hold_descriptions = build_holds_description(st.session_state["holds"])
+        if "beta_gif" not in st.session_state:
+            if st.button("🎬 Animate the beta", use_container_width=True):
+                _render_and_store_gif()
+                st.rerun()
 
-                progress_bar = st.progress(0)
-                status       = st.empty()
-
-                def on_progress(move_num, max_moves):
-                    progress_bar.progress(move_num / max_moves)
-                    status.caption(f"Generating move {move_num}...")
-
-                sequence, states = generate_sequence_iteratively(
-                    hold_descriptions,
-                    st.session_state["holds"],
-                    graph,
-                    current_start_holds,
-                    height_cm, difficulty, wall_angle, finish_style, extra_notes,
-                    image_height=image_height,
-                    progress_callback=on_progress
-                )
-
-                progress_bar.empty()
-                status.empty()
-
-                instructions = format_sequence_as_text(sequence, hold_descriptions)
-                st.session_state["instructions"] = instructions
-                st.session_state["sequence"]     = sequence
-                st.session_state["states"]       = states
-                st.session_state["current_step"] = 0
-                st.session_state["base_image"]   = st.session_state["annotated_image"]
-                st.session_state.pop("beta_gif", None)
-
-    if "instructions" in st.session_state:
-        st.markdown("""<p class="section-caption" style="margin-top:0.8rem;">A starting point — adapt it to your body, strengths, and style. Even experienced climbers refine beta on the wall.</p>""", unsafe_allow_html=True)
-        st.markdown(st.session_state["instructions"])
-
-    if "sequence" in st.session_state and st.session_state["sequence"]:
-        sequence     = st.session_state["sequence"]
-        current_step = st.session_state.get("current_step", 0)
-
-        section_header("05", "Walk it through", "Step through each move on the wall.")
-
-        overlay_image = draw_move_overlay(
-            st.session_state["base_image"],
-            st.session_state["holds"],
-            sequence,
-            current_step
-        )
-
-        current_move = sequence[current_step]
-        limb = current_move["limb"]
-        hold = current_move["hold"]
-        cue  = current_move.get("cue", "")
-
-        hold_str = f"Hold {hold}" if hold is not None else "wall"
-        st.markdown(f"""
-        <div class="move-card">
-            <div class="move-num">Move {current_step + 1} of {len(sequence)}</div>
-            <div class="move-text">{limb} &rarr; {hold_str}</div>
-            <div class="move-cue">{cue}</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-        st.image(overlay_image, width=700)
-
-        col_prev, col_next = st.columns(2)
-        with col_prev:
-            if st.button("Previous", use_container_width=True):
-                if st.session_state["current_step"] > 0:
-                    st.session_state["current_step"] -= 1
+        if "beta_gif" in st.session_state:
+            st.image(st.session_state["beta_gif"])
+            col_re, col_dl = st.columns(2)
+            with col_re:
+                if st.button("Re-render animation", use_container_width=True):
+                    _render_and_store_gif()
                     st.rerun()
-        with col_next:
-            if st.button("Next", use_container_width=True):
-                if st.session_state["current_step"] < len(sequence) - 1:
-                    st.session_state["current_step"] += 1
-                    st.rerun()
-
-        # ---- Animated demo ----
-        if "states" in st.session_state:
-            st.markdown("""<p class="section-caption" style="margin-top:1.2rem;">Or watch the whole beta as an animation.</p>""", unsafe_allow_html=True)
-
-            if "beta_gif" not in st.session_state:
-                if st.button("🎬 Animate the beta", use_container_width=True):
-                    with st.spinner("Rendering animation..."):
-                        gif_buf = render_beta_gif(
-                            st.session_state["base_image"],
-                            st.session_state["holds"],
-                            sequence,
-                            st.session_state["states"],
-                        )
-                        st.session_state["beta_gif"] = gif_buf.getvalue()
-                    st.rerun()
-
-            if "beta_gif" in st.session_state:
-                st.image(st.session_state["beta_gif"])
+            with col_dl:
                 st.download_button(
                     "Download GIF",
                     st.session_state["beta_gif"],
@@ -996,32 +1078,32 @@ if uploaded_file is not None:
                     use_container_width=True,
                 )
 
-    # ---- Rate My Beta ----
-    if "annotated_image" in st.session_state and st.session_state.get("holds"):
-        section_header("06", "Rate my beta", "Already have a sequence in mind? Describe it and get coaching feedback.")
+# ---- Rate My Beta ----
+if "annotated_image" in st.session_state and st.session_state.get("holds"):
+    section_header("06", "Rate my beta", "Already have a sequence in mind? Describe it and get coaching feedback.")
 
-        user_beta = st.text_area(
-            "Describe your beta",
-            placeholder="e.g. Start both hands on hold 5, LF on 2, RF on 1. Step RF up to 3, RH to 6, swap feet on 3...",
-            height=150,
-            key="user_beta_input",
-            label_visibility="collapsed"
-        )
+    user_beta = st.text_area(
+        "Describe your beta",
+        placeholder="e.g. Start both hands on hold 5, LF on 2, RF on 1. Step RF up to 3, RH to 6, swap feet on 3...",
+        height=150,
+        key="user_beta_input",
+        label_visibility="collapsed"
+    )
 
-        if st.button("Get coaching feedback", use_container_width=True, type="primary"):
-            if not user_beta.strip():
-                st.warning("Describe your sequence first — which hands and feet go where, in order.")
-            else:
-                with st.spinner("Your coach is taking a look..."):
-                    feedback = analyze_user_beta(
-                        st.session_state["annotated_image"],
-                        st.session_state["holds"],
-                        user_beta,
-                        height_cm, difficulty, wall_angle
-                    )
-                    st.session_state["beta_feedback"] = feedback
+    if st.button("Get coaching feedback", use_container_width=True, type="primary"):
+        if not user_beta.strip():
+            st.warning("Describe your sequence first — which hands and feet go where, in order.")
+        else:
+            with st.spinner("Your coach is taking a look..."):
+                feedback = analyze_user_beta(
+                    st.session_state["annotated_image"],
+                    st.session_state["holds"],
+                    user_beta,
+                    height_cm, difficulty, wall_angle
+                )
+                st.session_state["beta_feedback"] = feedback
 
-        if "beta_feedback" in st.session_state:
-            st.markdown(st.session_state["beta_feedback"])
+    if "beta_feedback" in st.session_state:
+        st.markdown(st.session_state["beta_feedback"])
 
 st.markdown("""<p class="climb-footer">climbai &mdash; get through the plateau</p>""", unsafe_allow_html=True)
