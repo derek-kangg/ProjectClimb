@@ -7,8 +7,14 @@ Includes two shape-level corrections learned from real gym photos:
 Claude's vision pass (in app.py) then labels type/use/orientation.
 """
 
+import base64
+import io
+
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+
+VALIDATION_MODEL = "claude-sonnet-4-6"
 
 COLOUR_RANGES = {
     "Black":  [(0, 0, 0),      (180, 80, 50)],
@@ -188,6 +194,209 @@ def find_hold_candidates(image_path, colour, min_area=80):
     for c in deduped:
         c.pop("grp", None)
     return deduped
+
+
+def marker_metrics(img_width):
+    """Marker radius and font scaled to image resolution — phone photos are
+    ~2000px+ and fixed-size markers become unreadably small."""
+    r = max(15, img_width // 70)
+    try:
+        font = ImageFont.load_default(size=max(11, int(r * 1.1)))
+    except TypeError:
+        font = ImageFont.load_default()
+    return r, font
+
+
+_SIZE_LABELS = {
+    "small":  "small (likely foothold)",
+    "medium": "medium (likely handhold)",
+    "large":  "large (likely handhold)",
+}
+
+
+def _resolve_merge_groups(validated, n):
+    """Group candidate numbers by Claude's same_hold_as links (with cycle
+    and range guards). Returns {root_number: [member_numbers]}."""
+    def root_of(i):
+        seen = {i}
+        while True:
+            t = validated.get(i, {}).get("same_hold_as")
+            if not isinstance(t, int) or t == i or t < 1 or t > n or t in seen:
+                return i
+            seen.add(t)
+            i = t
+
+    groups = {}
+    for i in range(1, n + 1):
+        groups.setdefault(root_of(i), []).append(i)
+    return groups
+
+
+def detect_and_validate_holds(client, image_path, colour):
+    """
+    Two-pass hold detection:
+    Pass 1 — OpenCV finds candidates by colour (pixel-accurate coordinates;
+              oversplitting is acceptable here).
+    Pass 2 — Claude sees the numbered image and (a) labels each hold's type,
+              use, and orientation, (b) merges markers that sit on the same
+              physical hold, (c) flags tape/non-hold markers for removal.
+    Returns: (annotated PIL image, holds list)
+    """
+    candidates = find_hold_candidates(image_path, colour)
+
+    if not candidates:
+        return Image.open(image_path).convert("RGB"), []
+
+    # Draw numbered candidates on a preview image for Claude to assess
+    preview = Image.open(image_path).convert("RGB")
+    preview_draw = ImageDraw.Draw(preview)
+    mr, mfont = marker_metrics(preview.width)
+    for i, c in enumerate(candidates, 1):
+        cx, cy = c["x"], c["y"]
+        preview_draw.ellipse([cx - mr, cy - mr, cx + mr, cy + mr], fill="#fb923c")
+        preview_draw.text((cx, cy), str(i), fill="black", font=mfont, anchor="mm")
+
+    buf = io.BytesIO()
+    preview.save(buf, format="JPEG")
+    image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # Also send the clean photo — markers cover exactly the details needed
+    # to judge whether neighbouring markers share one hold
+    raw = Image.open(image_path).convert("RGB")
+    raw_buf = io.BytesIO()
+    raw.save(raw_buf, format="JPEG")
+    raw_data = base64.b64encode(raw_buf.getvalue()).decode("utf-8")
+
+    candidate_list = "\n".join(
+        f"Candidate {i}: x={c['x']}, y={c['y']}, size={c['size']}"
+        for i, c in enumerate(candidates, 1)
+    )
+
+    tool = {
+        "name": "submit_validated_holds",
+        "description": "Submit validation results for each detected hold candidate",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "holds": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "number":       {"type": "integer"},
+                            "hold_type":    {"type": "string", "enum": ["jug", "crimp", "sloper", "pinch", "pocket", "edge", "volume", "chip", "tape", "unknown"]},
+                            "best_use":     {"type": "string", "enum": ["handhold", "foothold", "both"]},
+                            "orientation":  {"type": "string", "enum": ["top", "undercling", "side-pull left", "side-pull right", "unknown"], "description": "Which direction the usable surface faces: top = pull down on it (normal), undercling = usable surface faces down so palm goes up, side-pull left/right = vertical edge pulled sideways"},
+                            "same_hold_as": {"type": ["integer", "null"], "description": "If this marker sits on the SAME physical hold as a LOWER-numbered marker (fragments of one hold detected separately), the lower number. Otherwise null."}
+                        },
+                        "required": ["number", "hold_type", "best_use", "orientation", "same_hold_as"]
+                    }
+                }
+            },
+            "required": ["holds"]
+        }
+    }
+
+    response = client.messages.create(
+        model=VALIDATION_MODEL,
+        max_tokens=1500,
+        tools=[tool],
+        tool_choice={"type": "any"},
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": raw_data}},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
+                {"type": "text", "text": f"""Image 1 is a clean photo of a climbing wall. Image 2 is the same photo with {len(candidates)} numbered candidate markers detected by colour analysis (target colour: {colour}). Use image 1 to see details the markers cover in image 2. Automated detection makes two kinds of mistakes you must correct:
+- One physical hold can carry MULTIPLE markers (chalk patches or two-tone colouring split it). Look carefully at each cluster of nearby markers and decide whether they sit on one hold or several.
+- A marker can sit on route TAPE or another non-hold object instead of a hold.
+
+{candidate_list}
+
+For every candidate number, report:
+1. hold_type: jug / crimp / sloper / pinch / pocket / edge / volume / chip — or "tape" if the marker is on tape or not on any hold
+2. best_use: handhold, foothold, or both (small chips are typically footholds)
+3. orientation — which way the usable surface faces: top (pull down, normal), undercling (surface faces DOWN, palm-up), side-pull left or right. Look at shadows and shape.
+4. same_hold_as: if this marker is on the SAME physical hold as a lower-numbered marker, give that lower number; otherwise null.
+
+Assess every single candidate — do not skip any."""}
+            ]
+        }]
+    )
+
+    validated = {}
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "submit_validated_holds":
+            for h in block.input["holds"]:
+                validated[h["number"]] = h
+            break
+
+    groups = _resolve_merge_groups(validated, len(candidates))
+
+    # Build final holds list and annotated image
+    final_image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(final_image)
+    mr, mfont = marker_metrics(final_image.width)
+    box_w = max(3, final_image.width // 500)
+    final_holds = []
+    new_number = 1
+
+    for root in sorted(groups):
+        v = validated.get(root, {"hold_type": "unknown", "best_use": "both"})
+        if v.get("hold_type") == "tape":
+            continue
+
+        members = [candidates[m - 1] for m in groups[root]]
+        bx = min(m["bx"] for m in members)
+        by = min(m["by"] for m in members)
+        bw = max(m["bx"] + m["bw"] for m in members) - bx
+        bh = max(m["by"] + m["bh"] for m in members) - by
+        cx, cy = bx + bw // 2, by + bh // 2
+        size = max((m["size"] for m in members), key=lambda s: _SIZE_RANK[s])
+
+        best_use  = v.get("best_use", "both")
+        hold_type = v.get("hold_type", "unknown")
+
+        if best_use == "foothold" or size == "small":
+            size_label = "small (likely foothold)"
+        else:
+            size_label = _SIZE_LABELS[size]
+
+        final_holds.append({
+            "number":      new_number,
+            "x":           cx,
+            "y":           cy,
+            "size":        size_label,
+            "hold_type":   hold_type,
+            "best_use":    best_use,
+            "orientation": v.get("orientation", "unknown"),
+            "bx": bx, "by": by, "bw": bw, "bh": bh,
+        })
+
+        draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=box_w)
+        draw.ellipse([cx - mr, cy - mr, cx + mr, cy + mr], fill="#fb923c")
+        draw.text((cx, cy), str(new_number), fill="black", font=mfont, anchor="mm")
+        new_number += 1
+
+    return final_image, final_holds
+
+
+def redraw_annotation(image_path, holds):
+    """Redraw the numbered annotation from a holds list (after manual
+    add/remove edits). Boxes are drawn where bbox info exists."""
+    image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    mr, mfont = marker_metrics(image.width)
+    box_w = max(3, image.width // 500)
+
+    for h in holds:
+        if all(k in h for k in ("bx", "by", "bw", "bh")):
+            draw.rectangle([h["bx"], h["by"], h["bx"] + h["bw"], h["by"] + h["bh"]],
+                           outline="#fb923c", width=box_w)
+        draw.ellipse([h["x"] - mr, h["y"] - mr, h["x"] + mr, h["y"] + mr], fill="#fb923c")
+        draw.text((h["x"], h["y"]), str(h["number"]), fill="black", font=mfont, anchor="mm")
+
+    return image
 
 
 _SIZE_RANK = {"small": 0, "medium": 1, "large": 2}

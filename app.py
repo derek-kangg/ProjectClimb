@@ -2,8 +2,8 @@ from route_graph import build_reachability_graph, format_graph_for_prompt
 from beta_animation import render_beta_gif
 from climbing_knowledge import coaching_knowledge
 from sequence_engine import build_holds_description, generate_sequence_iteratively
-from hold_detection import find_hold_candidates
-from PIL import Image, ImageDraw, ImageFont
+from hold_detection import detect_and_validate_holds, redraw_annotation, marker_metrics as _marker_metrics
+from PIL import Image, ImageDraw
 import streamlit as st
 import anthropic
 from dotenv import load_dotenv
@@ -171,145 +171,6 @@ START:
             "wall_angle": wall_angle, "difficulty": difficulty,
         }, f, indent=2)
     return os.path.relpath(target, _APP_DIR)
-
-def _marker_metrics(img_width):
-    """Marker radius and font scaled to image resolution — phone photos are
-    ~2000px+ and fixed-size markers become unreadably small."""
-    r = max(15, img_width // 70)
-    try:
-        font = ImageFont.load_default(size=max(11, int(r * 1.1)))
-    except TypeError:
-        font = ImageFont.load_default()
-    return r, font
-
-
-def detect_and_validate_holds(image_path, colour):
-    """
-    Two-pass hold detection:
-    Pass 1 — OpenCV finds candidates by colour (hold_detection module:
-              colour mask + merged-blob splitting + tape filter).
-    Pass 2 — Claude Sonnet sees the annotated image and labels each hold's
-              type, best use, and orientation in one vision call.
-    Returns: (annotated PIL image, holds list)
-    """
-    candidates = find_hold_candidates(image_path, colour)
-
-    if not candidates:
-        return Image.open(image_path).convert("RGB"), []
-
-    # Draw numbered candidates on a preview image for Claude to assess
-    preview = Image.open(image_path).convert("RGB")
-    preview_draw = ImageDraw.Draw(preview)
-    mr, mfont = _marker_metrics(preview.width)
-    for i, c in enumerate(candidates, 1):
-        cx, cy = c["x"], c["y"]
-        preview_draw.ellipse([cx-mr, cy-mr, cx+mr, cy+mr], fill="#fb923c")
-        preview_draw.text((cx, cy), str(i), fill="black", font=mfont, anchor="mm")
-
-    buf = io.BytesIO()
-    preview.save(buf, format="JPEG")
-    image_data = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    candidate_list = "\n".join(
-        f"Candidate {i}: x={c['x']}, y={c['y']}, size={c['size']}"
-        for i, c in enumerate(candidates, 1)
-    )
-
-    # --- Pass 2: Claude validation ---
-    tool = {
-        "name": "submit_validated_holds",
-        "description": "Submit validation results for each detected hold candidate",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "holds": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "number":      {"type": "integer"},
-                            "hold_type":   {"type": "string", "enum": ["jug", "crimp", "sloper", "pinch", "pocket", "edge", "volume", "chip", "unknown"]},
-                            "best_use":    {"type": "string", "enum": ["handhold", "foothold", "both"]},
-                            "orientation": {"type": "string", "enum": ["top", "undercling", "side-pull left", "side-pull right", "unknown"], "description": "Which direction the usable surface faces: top = pull down on it (normal), undercling = usable surface faces down so palm goes up, side-pull left/right = vertical edge pulled sideways (side of the usable surface)"}
-                        },
-                        "required": ["number", "hold_type", "best_use", "orientation"]
-                    }
-                }
-            },
-            "required": ["holds"]
-        }
-    }
-
-    response = anthropic_client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1024,
-        tools=[tool],
-        tool_choice={"type": "any"},
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data}},
-                {"type": "text", "text": f"""This climbing wall image has {len(candidates)} numbered candidate holds detected by colour analysis (target colour: {colour}).
-
-{candidate_list}
-
-For every candidate number, identify:
-1. Hold type: jug / crimp / sloper / pinch / pocket / edge / volume / chip
-2. Best use: handhold, foothold, or both (small chips are typically footholds)
-3. Orientation — which way the usable surface faces. This changes how the hold is climbed: top (pull down, normal), undercling (usable surface faces DOWN, palm-up grip), side-pull left or right (vertical edge pulled sideways). Look carefully at the shadows and shape.
-
-Assess every single candidate — do not skip any."""}
-            ]
-        }]
-    )
-
-    validated = {}
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "submit_validated_holds":
-            for h in block.input["holds"]:
-                validated[h["number"]] = h
-            break
-
-    # Build final holds list and annotated image
-    final_image = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(final_image)
-    mr, mfont = _marker_metrics(final_image.width)
-    box_w = max(3, final_image.width // 500)
-    final_holds = []
-    new_number = 1
-
-    for i, c in enumerate(candidates, 1):
-        v = validated.get(i, {"hold_type": "unknown", "best_use": "both"})
-
-        cx, cy = c["x"], c["y"]
-        bx, by, bw, bh = c["bx"], c["by"], c["bw"], c["bh"]
-        best_use  = v.get("best_use", "both")
-        hold_type = v.get("hold_type", "unknown")
-
-        if best_use == "foothold" or c["size"] == "small":
-            size_label = "small (likely foothold)"
-        elif c["size"] == "large":
-            size_label = "large (likely handhold)"
-        else:
-            size_label = "medium (likely handhold)"
-
-        final_holds.append({
-            "number":      new_number,
-            "x":           cx,
-            "y":           cy,
-            "size":        size_label,
-            "hold_type":   hold_type,
-            "best_use":    best_use,
-            "orientation": v.get("orientation", "unknown"),
-        })
-
-        draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=box_w)
-        draw.ellipse([cx-mr, cy-mr, cx+mr, cy+mr], fill="#fb923c")
-        draw.text((cx, cy), str(new_number), fill="black", font=mfont, anchor="mm")
-        new_number += 1
-
-    return final_image, final_holds
-
 
 def format_sequence_as_text(sequence, hold_descriptions):
     lines = []
@@ -622,7 +483,7 @@ if uploaded_file is not None:
     if st.button("Detect holds", use_container_width=True, type="primary"):
         try:
             with st.spinner("Detecting holds and analysing types..."):
-                annotated_image, holds = detect_and_validate_holds(tmp_path, colour)
+                annotated_image, holds = detect_and_validate_holds(anthropic_client, tmp_path, colour)
                 st.session_state["annotated_image"] = annotated_image
                 st.session_state["holds"]           = holds
                 st.session_state["tmp_path"]        = tmp_path
@@ -654,12 +515,20 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
     holds           = st.session_state["holds"]
     annotated_image = st.session_state["annotated_image"]
 
-    st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect.</p>""", unsafe_allow_html=True)
+    st.markdown(f"""<p class="section-caption" style="margin-top:0.8rem;">Found <span class="accent-text">{len(holds)}</span> {colour.lower()} holds. Click the start hold(s) below — one if both hands start together, two if they start apart. Click again to deselect. Detection wrong somewhere? Switch the click mode to add or remove holds.</p>""", unsafe_allow_html=True)
+
+    click_mode = st.radio(
+        "Click mode",
+        ["Select start holds", "Add hold", "Remove hold"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="click_mode",
+    )
 
     from streamlit_image_coordinates import streamlit_image_coordinates
     value = streamlit_image_coordinates(annotated_image, key="hold_click", use_column_width="always")
 
-    if value is not None and "sequence" not in st.session_state:
+    if value is not None:
         # The component reports clicks in DISPLAYED pixels (plus the displayed
         # size) — rescale into original image space or taps on phones, where
         # the image is shrunk to fit, would land on the wrong holds.
@@ -679,11 +548,49 @@ if "annotated_image" in st.session_state and st.session_state.get("holds"):
                 closest_dist = dist
                 closest_hold = h
 
-        if closest_hold and closest_dist < threshold:
-            last_click = st.session_state.get("last_click", None)
-            new_click  = (value["x"], value["y"])
+        last_click = st.session_state.get("last_click", None)
+        new_click  = (value["x"], value["y"])
+        is_new_click = last_click != new_click
 
-            if last_click != new_click:
+        def _holds_edited():
+            """After add/remove: redraw annotation, drop stale downstream state."""
+            st.session_state["annotated_image"] = redraw_annotation(
+                st.session_state["tmp_path"], st.session_state["holds"])
+            for key in ("sequence", "states", "instructions", "beta_gif"):
+                st.session_state.pop(key, None)
+            save_route()
+
+        if is_new_click and click_mode == "Add hold":
+            st.session_state["last_click"] = new_click
+            new_num = max((h["number"] for h in holds), default=0) + 1
+            half = int(max(20, annotated_image.width * 0.02))
+            holds.append({
+                "number": new_num,
+                "x": int(click_x), "y": int(click_y),
+                "size": "medium (likely handhold)",
+                "hold_type": "unknown", "best_use": "both", "orientation": "unknown",
+                "bx": int(click_x) - half, "by": int(click_y) - half,
+                "bw": half * 2, "bh": half * 2,
+            })
+            st.session_state["holds"] = holds
+            _holds_edited()
+            st.toast(f"Added Hold {new_num}")
+            st.rerun()
+
+        elif is_new_click and click_mode == "Remove hold":
+            if closest_hold and closest_dist < threshold:
+                st.session_state["last_click"] = new_click
+                st.session_state["holds"] = [h for h in holds if h["number"] != closest_hold["number"]]
+                st.session_state["start_holds"] = [
+                    h for h in st.session_state.get("start_holds", [])
+                    if h["number"] != closest_hold["number"]
+                ]
+                _holds_edited()
+                st.toast(f"Removed Hold {closest_hold['number']}")
+                st.rerun()
+
+        elif is_new_click and click_mode == "Select start holds" and "sequence" not in st.session_state:
+            if closest_hold and closest_dist < threshold:
                 st.session_state["last_click"] = new_click
                 start_holds = st.session_state.get("start_holds", [])
                 hold_nums   = [h["number"] for h in start_holds]
