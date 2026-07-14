@@ -29,14 +29,21 @@ def _is_tape(contour, img_width):
     short, long_ = min(rw, rh), max(rw, rh)
     if short <= 0:
         return True
-    max_tape_width = max(14, img_width * 0.015)
-    return (long_ / short) > 2.8 and short < max_tape_width
+    max_tape_width = max(16, img_width * 0.025)
+    return (long_ / short) > 2.3 and short < max_tape_width
 
 
 def _split_merged_blob(mask, contour):
     """Try to split one contour that may contain 2+ touching holds.
-    Uses distance-transform peaks + watershed. Returns a list of contours
-    (full-image coordinates) if a split happened, else None."""
+
+    Watershed on distance-transform cores, then PAIRWISE neck analysis:
+    two adjacent pieces re-merge when the neck between them is nearly as
+    thick as the smaller piece's core (one chalky/patchy hold), and stay
+    apart when they meet at a thin pinch (two real holds). Junk cores get
+    absorbed by their neighbours instead of poisoning a global test.
+
+    Returns a list of contours (full-image coordinates) if a genuine split
+    remains, else None."""
     x, y, w, h = cv2.boundingRect(contour)
 
     # Isolated ROI mask of just this contour (not neighbours)
@@ -49,8 +56,6 @@ def _split_merged_blob(mask, contour):
     if peak <= 0:
         return None
 
-    # Core threshold must be low enough that a small hold's core survives
-    # next to a big hold's peak, with an absolute floor against noise
     core_thresh = max(0.35 * peak, 5.0)
     _, sure_fg = cv2.threshold(dist, core_thresh, 255, 0)
     sure_fg = np.uint8(sure_fg)
@@ -64,14 +69,55 @@ def _split_merged_blob(mask, contour):
     markers[unknown == 255] = 0
     cv2.watershed(cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR), markers)
 
+    labels = [lb for lb in range(2, n_labels + 1) if np.any(markers == lb)]
+    if len(labels) < 2:
+        return None
+
+    piece_masks = {lb: np.uint8(markers == lb) for lb in labels}
+    peaks = {lb: float(dist[markers == lb].max()) for lb in labels}
+    kern = np.ones((5, 5), np.uint8)
+    dilated = {lb: cv2.dilate(piece_masks[lb], kern) for lb in labels}
+
+    # union-find over pieces; merge pairs whose shared neck is fat
+    parent = {lb: lb for lb in labels}
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i, a in enumerate(labels):
+        for b in labels[i + 1:]:
+            shared = (dilated[a] > 0) & (dilated[b] > 0) & (roi > 0)
+            if not shared.any():
+                continue
+            neck = float(dist[shared].max())
+            if neck >= 0.65 * min(peaks[a], peaks[b]):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[ra] = rb
+
+    groups = {}
+    for lb in labels:
+        groups.setdefault(find(lb), []).append(lb)
+    if len(groups) < 2:
+        return None  # everything merged back -> one hold
+
     blob_area = cv2.contourArea(contour)
     pieces = []
-    for label in range(2, n_labels + 1):
-        piece = np.uint8(markers == label) * 255
-        cs, _ = cv2.findContours(piece, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+    for members in groups.values():
+        gmask = np.zeros_like(roi)
+        for lb in members:
+            gmask = cv2.bitwise_or(gmask, piece_masks[lb] * 255)
+        cs, _ = cv2.findContours(gmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
                                  offset=(x, y))
+        if not cs:
+            continue
+        biggest = max(cs, key=cv2.contourArea)
         # keep only substantial pieces — slivers mean a bad split
-        pieces.extend(c for c in cs if cv2.contourArea(c) > 0.025 * blob_area)
+        if cv2.contourArea(biggest) > 0.025 * blob_area:
+            pieces.append(biggest)
 
     return pieces if len(pieces) >= 2 else None
 
