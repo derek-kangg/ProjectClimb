@@ -2,12 +2,11 @@ from route_graph import build_reachability_graph, format_graph_for_prompt
 from beta_animation import render_beta_gif
 from climbing_knowledge import coaching_knowledge
 from sequence_engine import build_holds_description, generate_sequence_iteratively
-from PIL import Image, ImageDraw
+from hold_detection import find_hold_candidates
+from PIL import Image, ImageDraw, ImageFont
 import streamlit as st
 import anthropic
 from dotenv import load_dotenv
-import cv2
-import numpy as np
 import os
 import base64
 import tempfile
@@ -173,50 +172,27 @@ START:
         }, f, indent=2)
     return os.path.relpath(target, _APP_DIR)
 
-COLOUR_RANGES = {
-    "Black":  [(0, 0, 0),      (180, 80, 50)],
-    "Blue":   [(90, 50, 50),   (130, 255, 255)],
-    "Red":    [(0, 100, 100),  (10, 255, 255)],
-    "Green":  [(40, 50, 50),   (80, 255, 255)],
-    "Orange": [(10, 100, 100), (25, 255, 255)],
-    "Pink":   [(140, 50, 100), (170, 255, 255)],
-    "White":  [(0, 0, 180),    (180, 30, 255)],
-    "Yellow": [(25, 100, 100), (35, 255, 255)],
-    "Purple": [(130, 50, 50),  (160, 255, 255)],
-}
+def _marker_metrics(img_width):
+    """Marker radius and font scaled to image resolution — phone photos are
+    ~2000px+ and fixed-size markers become unreadably small."""
+    r = max(15, img_width // 70)
+    try:
+        font = ImageFont.load_default(size=max(11, int(r * 1.1)))
+    except TypeError:
+        font = ImageFont.load_default()
+    return r, font
 
 
 def detect_and_validate_holds(image_path, colour):
     """
     Two-pass hold detection:
-    Pass 1 — OpenCV finds candidates by colour (pixel-accurate coordinates).
-    Pass 2 — Claude Sonnet sees the annotated image, removes false positives,
-              and identifies hold types. All in one vision call.
-    Returns: (annotated PIL image, validated holds list with hold_type / best_use)
+    Pass 1 — OpenCV finds candidates by colour (hold_detection module:
+              colour mask + merged-blob splitting + tape filter).
+    Pass 2 — Claude Sonnet sees the annotated image and labels each hold's
+              type, best use, and orientation in one vision call.
+    Returns: (annotated PIL image, holds list)
     """
-    # --- Pass 1: OpenCV colour detection ---
-    cv_image = cv2.imread(image_path)
-    hsv = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-    low, high = COLOUR_RANGES[colour]
-    mask = cv2.inRange(hsv, np.array(low), np.array(high))
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < 80:
-            continue
-        bx, by, bw, bh = cv2.boundingRect(contour)
-        if bw < 12 or bh < 12:
-            continue
-        if by < cv_image.shape[0] * 0.03:
-            continue
-        cx, cy = bx + bw // 2, by + bh // 2
-        size = "small" if area < 500 else "medium" if area < 2000 else "large"
-        candidates.append({"bx": bx, "by": by, "bw": bw, "bh": bh, "x": cx, "y": cy, "size": size})
+    candidates = find_hold_candidates(image_path, colour)
 
     if not candidates:
         return Image.open(image_path).convert("RGB"), []
@@ -224,10 +200,11 @@ def detect_and_validate_holds(image_path, colour):
     # Draw numbered candidates on a preview image for Claude to assess
     preview = Image.open(image_path).convert("RGB")
     preview_draw = ImageDraw.Draw(preview)
+    mr, mfont = _marker_metrics(preview.width)
     for i, c in enumerate(candidates, 1):
         cx, cy = c["x"], c["y"]
-        preview_draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#fb923c")
-        preview_draw.text((cx-5, cy-8), str(i), fill="black")
+        preview_draw.ellipse([cx-mr, cy-mr, cx+mr, cy+mr], fill="#fb923c")
+        preview_draw.text((cx, cy), str(i), fill="black", font=mfont, anchor="mm")
 
     buf = io.BytesIO()
     preview.save(buf, format="JPEG")
@@ -296,6 +273,8 @@ Assess every single candidate — do not skip any."""}
     # Build final holds list and annotated image
     final_image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(final_image)
+    mr, mfont = _marker_metrics(final_image.width)
+    box_w = max(3, final_image.width // 500)
     final_holds = []
     new_number = 1
 
@@ -324,9 +303,9 @@ Assess every single candidate — do not skip any."""}
             "orientation": v.get("orientation", "unknown"),
         })
 
-        draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=3)
-        draw.ellipse([cx-15, cy-15, cx+15, cy+15], fill="#fb923c")
-        draw.text((cx-5, cy-8), str(new_number), fill="black")
+        draw.rectangle([bx, by, bx + bw, by + bh], outline="#fb923c", width=box_w)
+        draw.ellipse([cx-mr, cy-mr, cx+mr, cy+mr], fill="#fb923c")
+        draw.text((cx, cy), str(new_number), fill="black", font=mfont, anchor="mm")
         new_number += 1
 
     return final_image, final_holds
@@ -415,6 +394,11 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
         "swap left foot":   "#4ade80",
     }
 
+    # marker sizes scale with resolution (fixed sizes vanish on phone photos)
+    s = max(1.0, image.width / 770.0)
+    ring_w = max(2, int(2 * s))
+    mr, mfont = _marker_metrics(image.width)
+
     for move in sequence[:current_step]:
         if move["hold"] is None:
             continue
@@ -423,7 +407,8 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
             continue
         hx, hy = hold_map[hold_num]["x"], hold_map[hold_num]["y"]
         colour = COLOURS.get(move["limb"], "#ffffff")
-        draw.ellipse([hx-18, hy-18, hx+18, hy+18], outline=colour, width=2)
+        r = int(18 * s)
+        draw.ellipse([hx-r, hy-r, hx+r, hy+r], outline=colour, width=ring_w)
 
     current_move = sequence[current_step]
     if current_move["hold"] is not None:
@@ -431,9 +416,10 @@ def draw_move_overlay(base_image, holds, sequence, current_step):
         if hold_num in hold_map:
             hx, hy = hold_map[hold_num]["x"], hold_map[hold_num]["y"]
             colour = COLOURS.get(current_move["limb"], "#ffffff")
-            draw.ellipse([hx-35, hy-35, hx+35, hy+35], outline=colour, width=2)
-            draw.ellipse([hx-25, hy-25, hx+25, hy+25], fill=colour)
-            draw.text((hx-8, hy-10), str(current_move["move_number"]), fill="black")
+            r_out, r_in = int(35 * s), int(25 * s)
+            draw.ellipse([hx-r_out, hy-r_out, hx+r_out, hy+r_out], outline=colour, width=ring_w)
+            draw.ellipse([hx-r_in, hy-r_in, hx+r_in, hy+r_in], fill=colour)
+            draw.text((hx, hy), str(current_move["move_number"]), fill="black", font=mfont, anchor="mm")
 
     return image
 
