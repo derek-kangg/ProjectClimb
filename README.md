@@ -3,6 +3,8 @@
 Upload a photo of a bouldering wall and get an AI-generated, physically-validated
 climbing sequence — animated on your photo, move by move.
 
+**[Try it live → projectclimb.streamlit.app](https://projectclimb.streamlit.app)**
+
 <p align="center">
   <img src="assets/demo-beta.gif" width="420" alt="Animated beta demo — a colour-coded stick figure climbs the detected route" />
 </p>
